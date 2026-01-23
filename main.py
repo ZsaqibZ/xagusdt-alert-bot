@@ -18,7 +18,7 @@ SYMBOLS = [
 ]
 
 TIMEFRAME = '1h'       # 1 Hour Timeframe
-EXCHANGE = ccxt.binance() 
+EXCHANGE = ccxt.kucoin() 
 
 # Securely get keys from Render Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN") 
