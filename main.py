@@ -6,16 +6,21 @@ import asyncio
 from telegram import Bot
 from flask import Flask
 from threading import Thread
-import time
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SYMBOL = 'XAG/USDT'     # Silver vs Tether
-TIMEFRAME = '1h'       # Timeframe (15m, 1h, 4h, etc.)
-EXCHANGE = ccxt.binance() # Using Binance for data
+# The full list of pairs from your image
+SYMBOLS = [
+    'BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 
+    'SOL/USDT', 'ZEC/USDT', 'XMR/USDT', 'LTC/USDT', 
+    'XLM/USDT', 'DOGE/USDT', 'XAG/USDT', 'XAU/USDT'
+]
 
-# Get these from your Environment Variables (for security)
+TIMEFRAME = '1h'       # 1 Hour Timeframe
+EXCHANGE = ccxt.binance() 
+
+# Securely get keys from Render Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN") 
 CHAT_ID = os.environ.get("CHAT_ID")
 
@@ -26,10 +31,9 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "I am alive! The XAG bot is running."
+    return "I am alive! The Multi-Pair Bot is running."
 
 def run_http():
-    # FIXED: Use the PORT provided by Render, or default to 5000 if testing locally
     port = int(os.environ.get("PORT", 5000)) 
     app.run(host='0.0.0.0', port=port)
 
@@ -40,23 +44,20 @@ def keep_alive():
 # ==========================================
 # 2. TRADING LOGIC
 # ==========================================
-async def check_market():
-    print(f"Checking market for {SYMBOL}...")
-    
+async def check_market(symbol):
+    """
+    Checks a specific symbol for the EMA 9/21 Cross
+    """
     try:
-        # 1. Fetch OHLCV Data (Open, High, Low, Close, Volume)
-        bars = EXCHANGE.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
+        # Fetch data for the specific symbol passed to the function
+        bars = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
         df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
         
-        # 2. Calculate Indicators (EMA 9 and EMA 21)
+        # Calculate Indicators
         df['ema9'] = df.ta.ema(length=9)
         df['ema21'] = df.ta.ema(length=21)
 
-        # Get the last two completed candles (Current and Previous)
-        # We use -2 (previous) and -1 (current closed candle) logic 
-        # But usually in live bots, we look at the last completed candle (-2) vs the one before it (-3) 
-        # to ensure the candle has actually closed.
-        
+        # Get the last two completed candles
         prev_ema9 = df['ema9'].iloc[-3]
         prev_ema21 = df['ema21'].iloc[-3]
         
@@ -65,23 +66,16 @@ async def check_market():
         
         close_price = df['close'].iloc[-2]
 
-        # 3. Check Conditions (Crossover logic)
-        
-        # BUY: EMA 9 crosses OVER EMA 21
-        # (Previous 9 was below 21) AND (Current 9 is above 21)
+        # Check Conditions
         if prev_ema9 < prev_ema21 and curr_ema9 > curr_ema21:
             return "BUY", close_price
-
-        # SELL: EMA 9 crosses UNDER EMA 21
-        # (Previous 9 was above 21) AND (Current 9 is below 21)
         elif prev_ema9 > prev_ema21 and curr_ema9 < curr_ema21:
             return "SELL", close_price
-        
         else:
             return None, None
 
     except Exception as e:
-        print(f"Error fetching data: {e}")
+        print(f"Error fetching {symbol}: {e}")
         return None, None
 
 # ==========================================
@@ -89,37 +83,52 @@ async def check_market():
 # ==========================================
 async def main():
     bot = Bot(token=BOT_TOKEN)
-    print("Bot started...")
+    print(f"Bot started for {len(SYMBOLS)} pairs on {TIMEFRAME}...")
     
-    # State variable to ensure we don't spam the same signal
-    last_signal = None 
+    # Dictionary to store the last signal for EACH pair separately
+    # Example: {'BTC/USDT': 'BUY', 'ETH/USDT': 'SELL'}
+    last_signals = {} 
 
     while True:
-        signal, price = await check_market()
-        
-        if signal:
-            # Only send if the signal is different from the last one
-            if signal != last_signal:
-                message = f"🚨 **SIGNAL ALERT: {SYMBOL}** 🚨\n\n" \
-                          f"Direction: **{signal}**\n" \
-                          f"Price: {price}\n" \
-                          f"Strategy: EMA 9/21 Crossover\n" \
-                          f"Timeframe: {TIMEFRAME}"
-                
-                await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='Markdown')
-                print(f"Signal Sent: {signal}")
-                last_signal = signal
+        # Loop through every symbol in our list
+        for symbol in SYMBOLS:
+            
+            signal, price = await check_market(symbol)
+            
+            if signal:
+                # Check if this specific pair's signal has changed
+                # We use .get() in case the symbol isn't in the dictionary yet
+                if signal != last_signals.get(symbol):
+                    
+                    # Create the alert message
+                    message = f"🚨 **SIGNAL ALERT** 🚨\n\n" \
+                              f"Pair: **{symbol}**\n" \
+                              f"Direction: **{signal}**\n" \
+                              f"Price: {price}\n" \
+                              f"Timeframe: {TIMEFRAME}"
+                    
+                    try:
+                        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='Markdown')
+                        print(f"Sent Alert: {symbol} -> {signal}")
+                        
+                        # Update the "memory" for this specific symbol
+                        last_signals[symbol] = signal
+                        
+                    except Exception as e:
+                        print(f"Telegram Error: {e}")
+                else:
+                    print(f"{symbol}: Signal {signal} exists (Already sent).")
             else:
-                print("Signal detected, but already sent.")
-        else:
-            print("No signal.")
+                print(f"{symbol}: No Signal")
 
-        # Sleep for 60 seconds before checking again
-        await asyncio.sleep(60)
+            # PAUSE: Wait 2 seconds between coins to avoid Binance "Rate Limit" bans
+            await asyncio.sleep(2)
+
+        print("Cycle complete. Waiting before next check...")
+        # Wait 5 minutes before checking the whole list again
+        # (Since it's a 1H timeframe, checking every 5 mins is plenty)
+        await asyncio.sleep(300) 
 
 if __name__ == '__main__':
-    # Start the web server in the background
     keep_alive()
-    
-    # Start the bot
     asyncio.run(main())
