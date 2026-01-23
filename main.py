@@ -29,8 +29,9 @@ def home():
     return "I am alive! The XAG bot is running."
 
 def run_http():
-    # Run on port 10000 or whatever Render assigns
-    app.run(host='0.0.0.0', port=8080)
+    # FIXED: Use the PORT provided by Render, or default to 5000 if testing locally
+    port = int(os.environ.get("PORT", 5000)) 
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     t = Thread(target=run_http)
