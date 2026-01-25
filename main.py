@@ -17,7 +17,7 @@ SYMBOLS = [
     'XLM/USDT', 'DOGE/USDT', 'XAG/USDT', 'XAU/USDT'
 ]
 
-TIMEFRAME = '1h'       # 1 Hour Timeframe
+TIMEFRAME = '15m'       # 15 minute Timeframe
 EXCHANGE = ccxt.kucoin() 
 
 # Securely get keys from Render Environment Variables
