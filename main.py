@@ -11,7 +11,6 @@ from threading import Thread
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# All pairs from your list (Formatted for MEXC)
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'BNB/USDT', 'DOGE/USDT',
     'ADA/USDT', 'AVAX/USDT', 'SHIB/USDT', 'DOT/USDT', 'LTC/USDT', 'LINK/USDT',
@@ -27,18 +26,14 @@ SYMBOLS = [
     'ETC/USDT', 'NIGHT/USDT', 'H/USDT'
 ]
 
-# Default Timeframe
-current_timeframe = '1h'
-
-# Exchange: MEXC (Since you want to trade there)
 EXCHANGE = ccxt.mexc()
-
-# Securely get keys from Render Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN") 
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Global Dictionary to remember signals
-last_signals = {}
+# Global Settings
+current_timeframe = '1h'
+active_mode = 'both'  # Options: 'ema', 'sweep', 'both'
+last_signals = {}     # Memory to prevent spam
 
 # ==========================================
 # 1. KEEP ALIVE SERVER
@@ -47,7 +42,7 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return f"I am alive! Monitoring {len(SYMBOLS)} pairs on {current_timeframe}."
+    return f"Alive! Mode: {active_mode} | TF: {current_timeframe}"
 
 def run_http():
     port = int(os.environ.get("PORT", 5000)) 
@@ -58,132 +53,184 @@ def keep_alive():
     t.start()
 
 # ==========================================
-# 2. STRATEGY & CALCULATIONS
+# 2. STRATEGY A: EMA CROSSOVER
 # ==========================================
-async def check_market(symbol):
+def strategy_ema_cross(df):
+    """
+    Checks for EMA 9 crossing EMA 21
+    """
     try:
-        # Fetch OHLCV Data
-        bars = EXCHANGE.fetch_ohlcv(symbol, timeframe=current_timeframe, limit=100)
-        df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
-        
-        # --- STRATEGY INDICATORS ---
-        df['ema9'] = df.ta.ema(length=9)
-        df['ema21'] = df.ta.ema(length=21)
-        df['atr'] = df.ta.atr(length=14) # Volatility Indicator
-
-        # Get Current & Previous Values
         prev_ema9 = df['ema9'].iloc[-3]
         prev_ema21 = df['ema21'].iloc[-3]
         curr_ema9 = df['ema9'].iloc[-2]
         curr_ema21 = df['ema21'].iloc[-2]
-        
         close_price = df['close'].iloc[-2]
-        atr_value = df['atr'].iloc[-2]
+        atr = df['atr'].iloc[-2]
 
-        # --- LOGIC ---
-        
-        # BUY SIGNAL
         if prev_ema9 < prev_ema21 and curr_ema9 > curr_ema21:
-            sl = close_price - (2 * atr_value) # Stop Loss is 2x ATR below
-            tp = close_price + (4 * atr_value) # Take Profit is 4x ATR above
-            return "BUY", close_price, sl, tp
+            sl = close_price - (2 * atr)
+            tp = close_price + (4 * atr)
+            return "BUY", "EMA Cross", close_price, sl, tp
 
-        # SELL SIGNAL
         elif prev_ema9 > prev_ema21 and curr_ema9 < curr_ema21:
-            sl = close_price + (2 * atr_value) # Stop Loss is 2x ATR above
-            tp = close_price - (4 * atr_value) # Take Profit is 4x ATR below
-            return "SELL", close_price, sl, tp
+            sl = close_price + (2 * atr)
+            tp = close_price - (4 * atr)
+            return "SELL", "EMA Cross", close_price, sl, tp
+            
+    except:
+        pass
         
-        else:
-            return None, None, None, None
+    return None, None, None, None, None
+
+# ==========================================
+# 3. STRATEGY B: LIQUIDATION SWEEP (SFP)
+# ==========================================
+def strategy_liquidation_sweep(df, lookback=20):
+    """
+    Checks if price grabbed liquidity (High/Low) and reversed close.
+    """
+    try:
+        # Get data EXCLUDING the current candle to find the range
+        past_data = df.iloc[-lookback-2:-2] 
+        range_high = past_data['high'].max()
+        range_low = past_data['low'].min()
+
+        # Current Candle (The one that just closed)
+        curr_high = df['high'].iloc[-2]
+        curr_low = df['low'].iloc[-2]
+        curr_close = df['close'].iloc[-2]
+        atr = df['atr'].iloc[-2]
+
+        # BEARISH SWEEP (Short)
+        # Price went ABOVE range high (grabbed stops) but CLOSED BELOW it
+        if curr_high > range_high and curr_close < range_high:
+            sl = curr_high + (0.5 * atr) # Stop just above the wick
+            tp = curr_close - (3 * atr)  # Target lower
+            return "SELL", "Liquidity Sweep", curr_close, sl, tp
+
+        # BULLISH SWEEP (Long)
+        # Price went BELOW range low (grabbed stops) but CLOSED ABOVE it
+        if curr_low < range_low and curr_close > range_low:
+            sl = curr_low - (0.5 * atr)  # Stop just below the wick
+            tp = curr_close + (3 * atr)  # Target higher
+            return "BUY", "Liquidity Sweep", curr_close, sl, tp
+
+    except:
+        pass
+
+    return None, None, None, None, None
+
+# ==========================================
+# 4. MASTER ANALYSIS FUNCTION
+# ==========================================
+async def analyze_market(symbol):
+    try:
+        bars = EXCHANGE.fetch_ohlcv(symbol, timeframe=current_timeframe, limit=100)
+        df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+        
+        # Calculate Indicators
+        df['ema9'] = df.ta.ema(length=9)
+        df['ema21'] = df.ta.ema(length=21)
+        df['atr'] = df.ta.atr(length=14)
+
+        results = []
+
+        # Check Strategies based on 'active_mode'
+        if active_mode in ['ema', 'both']:
+            res = strategy_ema_cross(df)
+            if res[0]: results.append(res)
+
+        if active_mode in ['sweep', 'both']:
+            res = strategy_liquidation_sweep(df)
+            if res[0]: results.append(res)
+            
+        return results
 
     except Exception as e:
-        # Quietly fail for obscure pairs that might not be on Spot API
-        return None, None, None, None
+        return []
 
 # ==========================================
-# 3. TELEGRAM COMMANDS (INTERACTIVE)
+# 5. TELEGRAM COMMANDS
 # ==========================================
+async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global active_mode
+    try:
+        mode = context.args[0].lower()
+        if mode in ['ema', 'sweep', 'both']:
+            active_mode = mode
+            await update.message.reply_text(f"✅ Mode changed to: **{mode.upper()}**")
+        else:
+            await update.message.reply_text("❌ Invalid. Use: /mode ema, /mode sweep, /mode both")
+    except:
+        await update.message.reply_text(f"ℹ️ Current Mode: {active_mode}\nChange: /mode both")
+
 async def set_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_timeframe, last_signals
-    
-    # Get the user's message (e.g., "/timeframe 15m")
     try:
-        new_tf = context.args[0]
-        if new_tf in ['1m', '5m', '15m', '30m', '1h', '4h', '1d']:
-            current_timeframe = new_tf
-            last_signals = {} # Reset memory so we get fresh signals immediately
-            await update.message.reply_text(f"✅ Timeframe updated to: **{current_timeframe}**")
-        else:
-            await update.message.reply_text("❌ Invalid Timeframe. Use: 1m, 5m, 15m, 1h, 4h")
-    except (IndexError, ValueError):
-        await update.message.reply_text(f"ℹ️ Current Timeframe is: **{current_timeframe}**\nTo change, type: /timeframe 15m")
+        tf = context.args[0]
+        current_timeframe = tf
+        last_signals = {} 
+        await update.message.reply_text(f"✅ Timeframe: **{tf}**")
+    except:
+        await update.message.reply_text(f"ℹ️ Current TF: {current_timeframe}")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🟢 Bot is Running!\nExchange: MEXC\nPairs: {len(SYMBOLS)}\nTimeframe: {current_timeframe}")
+    await update.message.reply_text(f"🟢 Running\nTF: {current_timeframe}\nMode: {active_mode}\nPairs: {len(SYMBOLS)}")
 
 # ==========================================
-# 4. MAIN LOOP
+# 6. SCANNER LOOP
 # ==========================================
 async def scan_market(app):
-    """Background task to scan the market"""
     global last_signals
-    print("Market Scanner Started...")
+    print("Scanner Started...")
     
     while True:
         for symbol in SYMBOLS:
-            signal, price, sl, tp = await check_market(symbol)
+            signals = await analyze_market(symbol)
             
-            if signal:
-                # Unique ID for this signal (Symbol + Direction)
-                signal_id = f"{symbol}_{signal}_{current_timeframe}"
+            for (direction, strat_name, price, sl, tp) in signals:
                 
-                if last_signals.get(symbol) != signal_id:
+                # Unique ID: Symbol + Strategy + Direction + Timeframe
+                sig_id = f"{symbol}_{strat_name}_{direction}_{current_timeframe}"
+                
+                # If we haven't sent this exact signal yet...
+                if last_signals.get(symbol) != sig_id:
                     
-                    # Calculate formatting
-                    emoji = "🟢" if signal == "BUY" else "🔴"
+                    emoji = "🚀" if direction == "BUY" else "🔻"
                     
                     msg = (
-                        f"{emoji} **NEW SIGNAL: {symbol}**\n"
-                        f"-----------------------------\n"
-                        f"**Direction:** {signal}\n"
-                        f"**Entry:** {price:.4f}\n\n"
-                        f"🎯 **TP:** {tp:.4f}\n"
-                        f"🛑 **SL:** {sl:.4f}\n"
-                        f"-----------------------------\n"
+                        f"{emoji} **{strat_name.upper()} ALERT**\n"
+                        f"Coin: **{symbol}**\n"
+                        f"Side: **{direction}**\n"
+                        f"Entry: {price:.4f}\n\n"
+                        f"🎯 TP: {tp:.4f}\n"
+                        f"🛑 SL: {sl:.4f}\n"
                         f"Timeframe: {current_timeframe}"
                     )
                     
                     try:
-                        # Send to the fixed Chat ID
                         await app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-                        print(f"Sent: {symbol} {signal}")
-                        last_signals[symbol] = signal_id
-                    except Exception as e:
-                        print(f"Telegram Fail: {e}")
+                        print(f"Sent: {symbol} ({strat_name})")
+                        last_signals[symbol] = sig_id
+                    except:
+                        print("Msg Failed")
 
-            # Anti-Ban Pause (MEXC is sensitive)
-            await asyncio.sleep(1)
+            await asyncio.sleep(1) # Rate limit
 
-        print("Scan complete. Waiting...")
-        await asyncio.sleep(60) # Wait 1 min before next full scan
+        print("Scan cycle done.")
+        await asyncio.sleep(60)
 
 # ==========================================
-# 5. STARTUP
+# 7. MAIN ENTRY POINT
 # ==========================================
 if __name__ == '__main__':
     keep_alive()
-    
-    # Initialize Telegram Application
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Add Command Handlers
+    application.add_handler(CommandHandler("mode", set_mode))
     application.add_handler(CommandHandler("timeframe", set_timeframe))
     application.add_handler(CommandHandler("status", status))
 
-    # Run the Scanner in the background loop
     loop = asyncio.get_event_loop()
     loop.create_task(scan_market(application))
-    
-    # Start the Bot (Blocking)
     application.run_polling()
