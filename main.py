@@ -3,6 +3,7 @@ import ccxt
 import pandas as pd
 import pandas_ta as ta
 import asyncio
+from datetime import datetime, timezone, timedelta
 from telegram import Bot, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from flask import Flask
@@ -31,9 +32,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 # Global Settings
-current_timeframe = '1h'
-active_mode = 'both'  # Options: 'ema', 'sweep', 'both'
-last_signals = {}     # Memory to prevent spam
+current_timeframe = '15m' # Default to 15m for ORB strategy
+active_mode = 'all'       # Options: 'ema', 'sweep', 'orb', 'all'
+last_signals = {}         # Memory
 
 # ==========================================
 # 1. KEEP ALIVE SERVER
@@ -56,9 +57,6 @@ def keep_alive():
 # 2. STRATEGY A: EMA CROSSOVER
 # ==========================================
 def strategy_ema_cross(df):
-    """
-    Checks for EMA 9 crossing EMA 21
-    """
     try:
         prev_ema9 = df['ema9'].iloc[-3]
         prev_ema21 = df['ema21'].iloc[-3]
@@ -68,81 +66,117 @@ def strategy_ema_cross(df):
         atr = df['atr'].iloc[-2]
 
         if prev_ema9 < prev_ema21 and curr_ema9 > curr_ema21:
-            sl = close_price - (2 * atr)
-            tp = close_price + (4 * atr)
-            return "BUY", "EMA Cross", close_price, sl, tp
-
+            return "BUY", "EMA Cross", close_price, (close_price - 2*atr), (close_price + 4*atr)
         elif prev_ema9 > prev_ema21 and curr_ema9 < curr_ema21:
-            sl = close_price + (2 * atr)
-            tp = close_price - (4 * atr)
-            return "SELL", "EMA Cross", close_price, sl, tp
-            
-    except:
-        pass
-        
+            return "SELL", "EMA Cross", close_price, (close_price + 2*atr), (close_price - 4*atr)
+    except: pass
     return None, None, None, None, None
 
 # ==========================================
 # 3. STRATEGY B: LIQUIDATION SWEEP (SFP)
 # ==========================================
 def strategy_liquidation_sweep(df, lookback=20):
-    """
-    Checks if price grabbed liquidity (High/Low) and reversed close.
-    """
     try:
-        # Get data EXCLUDING the current candle to find the range
         past_data = df.iloc[-lookback-2:-2] 
         range_high = past_data['high'].max()
         range_low = past_data['low'].min()
-
-        # Current Candle (The one that just closed)
         curr_high = df['high'].iloc[-2]
         curr_low = df['low'].iloc[-2]
         curr_close = df['close'].iloc[-2]
         atr = df['atr'].iloc[-2]
 
-        # BEARISH SWEEP (Short)
-        # Price went ABOVE range high (grabbed stops) but CLOSED BELOW it
         if curr_high > range_high and curr_close < range_high:
-            sl = curr_high + (0.5 * atr) # Stop just above the wick
-            tp = curr_close - (3 * atr)  # Target lower
-            return "SELL", "Liquidity Sweep", curr_close, sl, tp
-
-        # BULLISH SWEEP (Long)
-        # Price went BELOW range low (grabbed stops) but CLOSED ABOVE it
+            return "SELL", "Liquidity Sweep", curr_close, (curr_high + 0.5*atr), (curr_close - 3*atr)
         if curr_low < range_low and curr_close > range_low:
-            sl = curr_low - (0.5 * atr)  # Stop just below the wick
-            tp = curr_close + (3 * atr)  # Target higher
-            return "BUY", "Liquidity Sweep", curr_close, sl, tp
-
-    except:
-        pass
-
+            return "BUY", "Liquidity Sweep", curr_close, (curr_low - 0.5*atr), (curr_close + 3*atr)
+    except: pass
     return None, None, None, None, None
 
 # ==========================================
-# 4. MASTER ANALYSIS FUNCTION
+# 4. STRATEGY C: NY OPEN ORB (15m)
+# ==========================================
+def strategy_ny_orb(df):
+    """
+    NY Open Breakout: 13:30 - 15:00 UTC
+    Only works if Timeframe is 15m.
+    """
+    try:
+        # 1. Check if we are in the NY Session (13:30 - 15:00 UTC)
+        now_utc = datetime.now(timezone.utc)
+        
+        # Define today's session times
+        start_time = now_utc.replace(hour=13, minute=30, second=0, microsecond=0)
+        end_time = now_utc.replace(hour=15, minute=0, second=0, microsecond=0)
+        
+        # If outside trading hours, return nothing
+        if not (start_time <= now_utc <= end_time):
+            return None, None, None, None, None
+
+        # 2. Find the ORB Candle (The 13:30 UTC candle)
+        # Convert df time (ms) to datetime objects
+        df['dt'] = pd.to_datetime(df['time'], unit='ms', utc=True)
+        
+        # Look for the specific candle at 13:30 today
+        orb_candle = df[df['dt'] == start_time]
+        
+        if orb_candle.empty:
+            return None, None, None, None, None # Candle not found yet
+
+        orb_high = orb_candle['high'].values[0]
+        orb_low = orb_candle['low'].values[0]
+
+        # 3. Current Market Data
+        curr_close = df['close'].iloc[-1] # Live price or last closed
+        curr_ema9 = df['ema9'].iloc[-1]
+        curr_ema21 = df['ema21'].iloc[-1]
+        atr = df['atr'].iloc[-1]
+
+        # 4. Breakout Logic + EMA Filter
+        # BUY: Close > ORB High AND EMA 9 > EMA 21
+        if curr_close > orb_high and curr_ema9 > curr_ema21:
+            sl = orb_low # SL at bottom of range
+            tp = curr_close + (2 * (orb_high - orb_low)) # TP is 2x the range size
+            return "BUY", "NY ORB Breakout", curr_close, sl, tp
+
+        # SELL: Close < ORB Low AND EMA 9 < EMA 21
+        if curr_close < orb_low and curr_ema9 < curr_ema21:
+            sl = orb_high # SL at top of range
+            tp = curr_close - (2 * (orb_high - orb_low))
+            return "SELL", "NY ORB Breakout", curr_close, sl, tp
+
+    except Exception as e:
+        pass
+        
+    return None, None, None, None, None
+
+# ==========================================
+# 5. MASTER ANALYSIS
 # ==========================================
 async def analyze_market(symbol):
     try:
-        bars = EXCHANGE.fetch_ohlcv(symbol, timeframe=current_timeframe, limit=100)
+        # Fetch slightly more data to ensure we find the 13:30 candle
+        bars = EXCHANGE.fetch_ohlcv(symbol, timeframe=current_timeframe, limit=200)
         df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
         
-        # Calculate Indicators
         df['ema9'] = df.ta.ema(length=9)
         df['ema21'] = df.ta.ema(length=21)
         df['atr'] = df.ta.atr(length=14)
 
         results = []
 
-        # Check Strategies based on 'active_mode'
-        if active_mode in ['ema', 'both']:
+        if active_mode in ['ema', 'all']:
             res = strategy_ema_cross(df)
             if res[0]: results.append(res)
 
-        if active_mode in ['sweep', 'both']:
+        if active_mode in ['sweep', 'all']:
             res = strategy_liquidation_sweep(df)
             if res[0]: results.append(res)
+            
+        if active_mode in ['orb', 'all']:
+            # Only run ORB if TF is 15m
+            if current_timeframe == '15m':
+                res = strategy_ny_orb(df)
+                if res[0]: results.append(res)
             
         return results
 
@@ -150,19 +184,19 @@ async def analyze_market(symbol):
         return []
 
 # ==========================================
-# 5. TELEGRAM COMMANDS
+# 6. TELEGRAM COMMANDS
 # ==========================================
 async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global active_mode
     try:
         mode = context.args[0].lower()
-        if mode in ['ema', 'sweep', 'both']:
+        if mode in ['ema', 'sweep', 'orb', 'all']:
             active_mode = mode
-            await update.message.reply_text(f"✅ Mode changed to: **{mode.upper()}**")
+            await update.message.reply_text(f"✅ Mode set to: **{mode.upper()}**")
         else:
-            await update.message.reply_text("❌ Invalid. Use: /mode ema, /mode sweep, /mode both")
+            await update.message.reply_text("❌ Use: /mode ema, /mode sweep, /mode orb, /mode all")
     except:
-        await update.message.reply_text(f"ℹ️ Current Mode: {active_mode}\nChange: /mode both")
+        await update.message.reply_text(f"ℹ️ Current Mode: {active_mode}")
 
 async def set_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_timeframe, last_signals
@@ -171,14 +205,17 @@ async def set_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_timeframe = tf
         last_signals = {} 
         await update.message.reply_text(f"✅ Timeframe: **{tf}**")
+        if tf != '15m':
+             await update.message.reply_text("⚠️ Note: 'NY ORB' strategy only works on 15m!")
     except:
         await update.message.reply_text(f"ℹ️ Current TF: {current_timeframe}")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🟢 Running\nTF: {current_timeframe}\nMode: {active_mode}\nPairs: {len(SYMBOLS)}")
+    now_utc = datetime.now(timezone.utc).strftime('%H:%M UTC')
+    await update.message.reply_text(f"🟢 Running\nTime: {now_utc}\nTF: {current_timeframe}\nMode: {active_mode}")
 
 # ==========================================
-# 6. SCANNER LOOP
+# 7. MAIN LOOP
 # ==========================================
 async def scan_market(app):
     global last_signals
@@ -189,40 +226,31 @@ async def scan_market(app):
             signals = await analyze_market(symbol)
             
             for (direction, strat_name, price, sl, tp) in signals:
+                sig_id = f"{symbol}_{strat_name}_{direction}_{current_timeframe}_{datetime.now().hour}"
                 
-                # Unique ID: Symbol + Strategy + Direction + Timeframe
-                sig_id = f"{symbol}_{strat_name}_{direction}_{current_timeframe}"
-                
-                # If we haven't sent this exact signal yet...
                 if last_signals.get(symbol) != sig_id:
-                    
-                    emoji = "🚀" if direction == "BUY" else "🔻"
+                    emoji = "🗽" if strat_name == "NY ORB Breakout" else ("🚀" if direction == "BUY" else "🔻")
                     
                     msg = (
-                        f"{emoji} **{strat_name.upper()} ALERT**\n"
+                        f"{emoji} **{strat_name.upper()}**\n"
                         f"Coin: **{symbol}**\n"
                         f"Side: **{direction}**\n"
                         f"Entry: {price:.4f}\n\n"
                         f"🎯 TP: {tp:.4f}\n"
                         f"🛑 SL: {sl:.4f}\n"
-                        f"Timeframe: {current_timeframe}"
+                        f"TF: {current_timeframe}"
                     )
                     
                     try:
                         await app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
                         print(f"Sent: {symbol} ({strat_name})")
                         last_signals[symbol] = sig_id
-                    except:
-                        print("Msg Failed")
+                    except: pass
+            
+            await asyncio.sleep(1)
 
-            await asyncio.sleep(1) # Rate limit
-
-        print("Scan cycle done.")
         await asyncio.sleep(60)
 
-# ==========================================
-# 7. MAIN ENTRY POINT
-# ==========================================
 if __name__ == '__main__':
     keep_alive()
     application = ApplicationBuilder().token(BOT_TOKEN).build()
