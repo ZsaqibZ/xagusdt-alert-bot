@@ -75,7 +75,7 @@ def strategy_ema_cross(df):
 # ==========================================
 # 3. STRATEGY B: LIQUIDATION SWEEP (SFP)
 # ==========================================
-def strategy_liquidation_sweep(df, lookback=20):
+def strategy_liquidation_sweep(df, lookback=100):
     try:
         past_data = df.iloc[-lookback-2:-2] 
         range_high = past_data['high'].max()
