@@ -63,13 +63,9 @@ def keep_alive():
 # 2. STRATEGY 1: TREND-PULLBACK TRAP
 # ==========================================
 def strategy_trend_pullback(df, lookback):
-    """
-    Logic: Uptrend (Price > EMA200) + Sweep of Low + Bullish Rejection
-    """
     try:
         candle_time = df['time'].iloc[-2]
         
-        # Indicators
         curr_close = df['close'].iloc[-2]
         curr_open = df['open'].iloc[-2]
         curr_low = df['low'].iloc[-2]
@@ -79,26 +75,20 @@ def strategy_trend_pullback(df, lookback):
         ema200 = df['ema200'].iloc[-2]
         atr = df['atr'].iloc[-2]
 
-        # Find recent liquidity zones (Lowest Low of last X candles)
+        # Liquidity Zones
         past_lows = df['low'].iloc[-lookback-2:-2]
         recent_low = past_lows.min()
         
         past_highs = df['high'].iloc[-lookback-2:-2]
         recent_high = past_highs.max()
 
-        # --- LONG SETUP ---
-        # 1. Trend is UP (Price > EMA 200)
-        # 2. Sweep: Price dipped below recent low
-        # 3. Rejection: Candle closed GREEN (Close > Open) and back above the low
+        # LONG
         if (curr_close > ema200) and (curr_low < recent_low) and (curr_close > curr_open):
             sl = curr_low - (0.5 * atr)
-            tp = curr_close + (3 * atr) # 1:3 RR approx
+            tp = curr_close + (3 * atr) 
             return "BUY", "Trend Trap 🪤", curr_close, sl, tp, candle_time
 
-        # --- SHORT SETUP ---
-        # 1. Trend is DOWN (Price < EMA 200)
-        # 2. Sweep: Price poked above recent high
-        # 3. Rejection: Candle closed RED (Close < Open) and back below the high
+        # SHORT
         if (curr_close < ema200) and (curr_high > recent_high) and (curr_close < curr_open):
             sl = curr_high + (0.5 * atr)
             tp = curr_close - (3 * atr)
@@ -111,9 +101,6 @@ def strategy_trend_pullback(df, lookback):
 # 3. STRATEGY 2: VWAP + RSI MEAN REVERSION
 # ==========================================
 def strategy_vwap_rsi(df):
-    """
-    Logic: Price far from VWAP + Overbought/Oversold RSI + Rejection
-    """
     try:
         candle_time = df['time'].iloc[-2]
         curr_close = df['close'].iloc[-2]
@@ -123,19 +110,13 @@ def strategy_vwap_rsi(df):
         rsi = df['rsi'].iloc[-2]
         atr = df['atr'].iloc[-2]
 
-        # --- SHORT (Overextended Up) ---
-        # 1. Price is above VWAP
-        # 2. RSI is Overbought (> 70)
-        # 3. Bearish Candle (Close < Open) - Immediate Rejection
+        # SHORT (Overextended Up)
         if (curr_close > vwap) and (rsi >= 70) and (curr_close < curr_open):
             sl = df['high'].iloc[-2] + atr
-            tp = vwap # Target return to mean
+            tp = vwap 
             return "SELL", "VWAP Sniper 🎯", curr_close, sl, tp, candle_time
 
-        # --- LONG (Overextended Down) ---
-        # 1. Price is below VWAP
-        # 2. RSI is Oversold (< 30)
-        # 3. Bullish Candle (Close > Open)
+        # LONG (Overextended Down)
         if (curr_close < vwap) and (rsi <= 30) and (curr_close > curr_open):
             sl = df['low'].iloc[-2] - atr
             tp = vwap
@@ -148,10 +129,6 @@ def strategy_vwap_rsi(df):
 # 4. STRATEGY 3: BREAKOUT RETEST + FUNDING
 # ==========================================
 async def strategy_funding_retest(df, symbol):
-    """
-    Logic: Trend Retest + Funding Rate Bias
-    *Note: Fetches live funding rate from Exchange*
-    """
     try:
         candle_time = df['time'].iloc[-2]
         curr_close = df['close'].iloc[-2]
@@ -162,30 +139,23 @@ async def strategy_funding_retest(df, symbol):
         ema50 = df['ema50'].iloc[-2]
         atr = df['atr'].iloc[-2]
         
-        # Check Technical Setup FIRST (to save API calls)
-        # Short Setup: Price < EMA50 (Downtrend) AND Price touched EMA50 (Retest) AND Bearish Close
         is_short_setup = (curr_close < ema50) and (curr_high >= ema50) and (curr_close < curr_open)
-        
-        # Long Setup: Price > EMA50 (Uptrend) AND Price touched EMA50 (Retest) AND Bullish Close
         is_long_setup = (curr_close > ema50) and (curr_low <= ema50) and (curr_close > curr_open)
 
         if not (is_short_setup or is_long_setup):
             return None, None, None, None, None, None
 
-        # --- FETCH FUNDING RATE ---
-        # Only fetch if technicals match
+        # Fetch Funding
         funding_info = EXCHANGE.fetch_funding_rate(symbol)
         funding_rate = funding_info['fundingRate']
 
-        # --- SHORT EXECUTION ---
-        # Funding is Positive (> 0.01%) -> Crowd is Long -> We Short
+        # Short (Crowded Longs)
         if is_short_setup and funding_rate > 0.0001:
             sl = curr_high + atr
             tp = curr_close - (3 * atr)
             return "SELL", "Funding Bias 🏦", curr_close, sl, tp, candle_time
 
-        # --- LONG EXECUTION ---
-        # Funding is Negative (< -0.01%) -> Crowd is Short -> We Long
+        # Long (Crowded Shorts)
         if is_long_setup and funding_rate < -0.0001:
             sl = curr_low - atr
             tp = curr_close + (3 * atr)
@@ -195,12 +165,9 @@ async def strategy_funding_retest(df, symbol):
     return None, None, None, None, None, None
 
 # ==========================================
-# 5. STRATEGY 4: RAW LIQUIDITY SWEEP (Legacy)
+# 5. STRATEGY 4: RAW LIQUIDITY SWEEP
 # ==========================================
 def strategy_raw_sweep(df, lookback):
-    """
-    The original Sweep strategy (No trend filter, pure price action)
-    """
     try:
         candle_time = df['time'].iloc[-2]
         past_data = df.iloc[-lookback-2:-2] 
@@ -242,7 +209,9 @@ def strategy_ny_orb(df):
         prev_close = df['close'].iloc[-3]
         curr_ema9 = df['ema9'].iloc[-2]
         curr_ema21 = df['ema21'].iloc[-2]
-        curr_vol = df['vol'].iloc[-2]
+        
+        # FIXED: Use 'volume' instead of 'vol'
+        curr_vol = df['volume'].iloc[-2]
         avg_vol = df['vol_avg'].iloc[-2]
 
         if (last_close > orb_high and prev_close > orb_high) and (curr_ema9 > curr_ema21) and (curr_vol > avg_vol):
@@ -262,32 +231,29 @@ async def analyze_market(symbol):
 
     # --- ENGINE 1: MULTI-STRATEGY CORE ---
     try:
-        bars_main = EXCHANGE.fetch_ohlcv(symbol, timeframe=main_timeframe, limit=200) # Increased limit for EMA200
-        df = pd.DataFrame(bars_main, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+        # FIXED: Column name changed to 'volume' for pandas_ta compatibility
+        bars_main = EXCHANGE.fetch_ohlcv(symbol, timeframe=main_timeframe, limit=200)
+        df = pd.DataFrame(bars_main, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         
         # Calc Indicators
         df['ema50'] = df.ta.ema(length=50)
         df['ema200'] = df.ta.ema(length=200)
-        df['vwap'] = df.ta.vwap()
+        df['vwap'] = df.ta.vwap() # This was causing the crash, now fixed!
         df['rsi'] = df.ta.rsi(length=14)
         df['atr'] = df.ta.atr(length=14)
         
-        # 1. Trend Pullback Trap
         if active_mode in ['trend', 'all']:
             res = strategy_trend_pullback(df, sweep_lookback)
             if res[0]: results.append(res)
 
-        # 2. VWAP Mean Reversion
         if active_mode in ['vwap', 'all']:
             res = strategy_vwap_rsi(df)
             if res[0]: results.append(res)
             
-        # 3. Funding Bias
         if active_mode in ['funding', 'all']:
             res = await strategy_funding_retest(df, symbol)
             if res[0]: results.append(res)
 
-        # 4. Raw Sweep (Legacy)
         if active_mode in ['sweep', 'all']:
             res = strategy_raw_sweep(df, sweep_lookback)
             if res[0]: results.append(res)
@@ -297,11 +263,13 @@ async def analyze_market(symbol):
     # --- ENGINE 2: NY ORB ---
     if orb_active:
         try:
+            # FIXED: Column name changed to 'volume'
             bars_orb = EXCHANGE.fetch_ohlcv(symbol, timeframe=orb_timeframe, limit=100)
-            df_orb = pd.DataFrame(bars_orb, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+            df_orb = pd.DataFrame(bars_orb, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
             df_orb['ema9'] = df_orb.ta.ema(length=9)
             df_orb['ema21'] = df_orb.ta.ema(length=21)
-            df_orb['vol_avg'] = df_orb.ta.sma(close=df_orb['vol'], length=20)
+            # FIXED: Explicitly referencing 'volume'
+            df_orb['vol_avg'] = df_orb.ta.sma(close=df_orb['volume'], length=20)
 
             res_orb = strategy_ny_orb(df_orb)
             if res_orb[0]: results.append(res_orb)
@@ -316,7 +284,7 @@ async def set_main_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE)
     global main_timeframe, last_signals
     try:
         tf = context.args[0]
-        if tf in ['15m', '1h', '4h', '8h', '12h', '1d']: # Added 8h and 12h
+        if tf in ['15m', '1h', '4h', '8h', '12h', '1d']: 
             main_timeframe = tf
             last_signals = {} 
             await update.message.reply_text(f"✅ Main Engine TF: **{tf}**")
