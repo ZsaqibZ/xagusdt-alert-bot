@@ -69,7 +69,7 @@ SYMBOLS_RAW = [
 SYMBOLS = []
 
 VALID_TIMEFRAMES = [‘15m’, ‘1h’, ‘4h’, ‘8h’, ‘12h’, ‘1d’]
-active_timeframes = [‘4h’, ‘1d’]
+active_timeframes = [‘1h’, ‘4h’]
 LOOKBACK = 50
 RR_MINIMUM = 1.5
 
