@@ -3,4 +3,5 @@ ccxt
 pandas
 pandas_ta
 flask
+pytz
 gunicorn
