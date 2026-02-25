@@ -58,7 +58,7 @@ LOOKBACK = 50
 RR_MINIMUM = 1.5
 
 # Swapped to MEXC Perpetual format
-GOLD_SYMBOL = 'XAU/USDT:USDT'
+GOLD_SYMBOL = 'XAUT/USDT:USDT'
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
