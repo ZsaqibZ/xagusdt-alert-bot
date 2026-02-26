@@ -1,6 +1,7 @@
 import os
 import ccxt.async_support as ccxt
 import pandas as pd
+import numpy as np
 import asyncio
 import pytz
 from datetime import datetime
@@ -17,8 +18,8 @@ GOLD_SYMBOL = 'XAUT/USDT:USDT'
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Store the date of the last signal to prevent spamming multiple alerts a day
-last_signal_date = None 
+TIMEFRAME = '15m'
+last_signal_time = None
 
 # Exchange Setup
 exchange = ccxt.mexc({
@@ -34,7 +35,7 @@ app = Flask('')
 
 @app.route('/')
 def home(): 
-    return "NY Open Gold Bot is Running!"
+    return "Golden Quant Bot is Running!"
 
 def run_http(): 
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
@@ -43,70 +44,75 @@ def keep_alive():
     Thread(target=run_http, daemon=True).start()
 
 # ==========================================
-# 3. NY OPEN STRATEGY LOGIC
+# 3. QUANT INDICATOR MATH
 # ==========================================
 
-async def analyze_ny_open():
+def calculate_indicators(df):
+    # 1. EMA 200 (Trend Filter)
+    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+
+    # 2. MACD (12, 26, 9) (Momentum)
+    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = df['ema12'] - df['ema26']
+    df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+
+    # 3. RSI 14 (Overbought/Oversold Filter)
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    # 4. ATR 14 (Dynamic Risk Management)
+    df['tr0'] = abs(df['high'] - df['low'])
+    df['tr1'] = abs(df['high'] - df['close'].shift(1))
+    df['tr2'] = abs(df['low'] - df['close'].shift(1))
+    df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
+    df['atr'] = df['tr'].rolling(window=14).mean()
+    
+    return df
+
+# ==========================================
+# 4. STRATEGY LOGIC
+# ==========================================
+
+def analyze_quant_gold(df):
     try:
-        ny_tz = pytz.timezone('America/New_York')
-        now_ny = datetime.now(ny_tz)
-        current_date_str = now_ny.strftime('%Y-%m-%d')
-        
-        # 1. Ensure we are past 09:00 AM NY time (The 08:00 candle must be fully closed)
-        if now_ny.hour < 9:
+        if len(df) < 205: # Need enough data for the 200 EMA
             return None
             
-        # 2. Fetch Daily Data to determine CCT (Candle Continuity Theory) Bias
-        daily_bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe='1d', limit=2)
-        if not daily_bars: return None
+        df = calculate_indicators(df)
         
-        yesterday = daily_bars[-2] # [time, open, high, low, close, vol]
-        daily_bias = "BULLISH" if yesterday[4] > yesterday[1] else "BEARISH"
+        # Look at the last fully closed candle (curr) and the one before it (prev) to detect crossovers
+        curr = df.iloc[-2]
+        prev = df.iloc[-3]
+        
+        close_price = curr['close']
+        ema200 = curr['ema200']
+        rsi = curr['rsi']
+        atr = curr['atr']
+        c_time = curr['time']
 
-        # 3. Fetch 1H Data to find today's 08:00 AM NY Candle High/Low
-        hourly_bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe='1h', limit=24)
-        df_1h = pd.DataFrame(hourly_bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # Convert UTC timestamps to NY Time to locate the exact 08:00 candle
-        df_1h['ny_time'] = pd.to_datetime(df_1h['time'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(ny_tz)
-        
-        # Filter for today's 08:00 AM candle
-        target_candle = df_1h[(df_1h['ny_time'].dt.date == now_ny.date()) & (df_1h['ny_time'].dt.hour == 8)]
-        
-        if target_candle.empty:
-            return None
-            
-        ny_high = target_candle.iloc[0]['high']
-        ny_low = target_candle.iloc[0]['low']
+        # Check MACD Crossovers
+        bullish_macd_cross = (prev['macd'] <= prev['signal']) and (curr['macd'] > curr['signal'])
+        bearish_macd_cross = (prev['macd'] >= prev['signal']) and (curr['macd'] < curr['signal'])
 
-        # 4. Fetch 5m Data to look for the sweep and displacement
-        five_min_bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe='5m', limit=30)
-        df_5m = pd.DataFrame(five_min_bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # We look at the last fully closed 5m candle (prev_5m) and the one right before it (sweep_5m)
-        sweep_5m = df_5m.iloc[-3]
-        confirm_5m = df_5m.iloc[-2]
-        
-        # --- BEARISH REVERSAL SETUP (Sweeps High, Closes Below) ---
-        if sweep_5m['high'] > ny_high and confirm_5m['close'] < ny_high:
-            entry = confirm_5m['close']
-            sl = max(sweep_5m['high'], confirm_5m['high'])
-            risk = abs(sl - entry)
-            tp = entry - (risk * 2) # Target 1:2 RR
-            
-            # Filter: Check if velocity is aggressive (happening within a few hours of the open)
-            if now_ny.hour <= 12: 
-                return ("SHORT", entry, sl, tp, daily_bias, ny_high, ny_low, current_date_str)
+        # --- LONG ENTRY CONDITIONS ---
+        if bullish_macd_cross and (close_price > ema200) and (40 <= rsi <= 65):
+            entry = close_price
+            sl = entry - (1.5 * atr)
+            tp = entry + (3.0 * atr)
+            return ("LONG", entry, sl, tp, rsi, atr, c_time)
 
-        # --- BULLISH REVERSAL SETUP (Sweeps Low, Closes Above) ---
-        if sweep_5m['low'] < ny_low and confirm_5m['close'] > ny_low:
-            entry = confirm_5m['close']
-            sl = min(sweep_5m['low'], confirm_5m['low'])
-            risk = abs(entry - sl)
-            tp = entry + (risk * 2) # Target 1:2 RR
-            
-            if now_ny.hour <= 12:
-                return ("LONG", entry, sl, tp, daily_bias, ny_high, ny_low, current_date_str)
+        # --- SHORT ENTRY CONDITIONS ---
+        if bearish_macd_cross and (close_price < ema200) and (35 <= rsi <= 60):
+            entry = close_price
+            sl = entry + (1.5 * atr)
+            tp = entry - (3.0 * atr)
+            return ("SHORT", entry, sl, tp, rsi, atr, c_time)
 
     except Exception as e:
         print(f"[Strategy Error] {e}")
@@ -114,75 +120,87 @@ async def analyze_ny_open():
     return None
 
 # ==========================================
-# 4. BOT SCANNER LOOP
+# 5. BOT SCANNER LOOP
 # ==========================================
 
-async def gold_scanner(application):
-    global last_signal_date
-    print(f"🗽 NY Open Gold Strategy Started. Monitoring {GOLD_SYMBOL}...")
+async def quant_scanner(application):
+    global last_signal_time
+    print(f"⚙️ Golden Quant Strategy Started. Scanning {GOLD_SYMBOL} on {TIMEFRAME}...")
+    
+    # Set timezone to Pakistan Standard Time (PKT) for logging
+    pkt_tz = pytz.timezone('Asia/Karachi')
     
     while True:
         try:
-            signal = await analyze_ny_open()
+            bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe=TIMEFRAME, limit=250)
+            if not bars:
+                await asyncio.sleep(20)
+                continue
+                
+            df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+            
+            signal = analyze_quant_gold(df)
             
             if signal:
-                direction, entry, sl, tp, daily_bias, ny_high, ny_low, sig_date = signal
+                direction, entry, sl, tp, rsi, atr, sig_time = signal
                 
-                # Only send one signal per day to avoid spamming the same setup
-                if last_signal_date != sig_date:
+                # Prevent duplicate alerts for the exact same closed candle
+                if last_signal_time != sig_time:
+                    sig_datetime = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d %I:%M %p PKT')
                     emoji = "🔴" if direction == "SHORT" else "🟢"
                     
-                    # CCT Confluence Check
-                    confluence = "✅ Matches Daily Bias" if (direction == "SHORT" and daily_bias == "BEARISH") or (direction == "LONG" and daily_bias == "BULLISH") else "⚠️ Against Daily Bias"
-
-                    msg = (f"{emoji} **NY OPEN GOLD SWEEP** {emoji}\n\n"
-                           f"**{direction}** Reversal Triggered\n"
-                           f"**Daily Bias (CCT):** {daily_bias} ({confluence})\n\n"
-                           f"🏦 **08:00 AM NY Range:**\n"
-                           f"High: `${ny_high:.2f}`\n"
-                           f"Low: `${ny_low:.2f}`\n\n"
-                           f"⚡ **5m Displacement Entry:**\n"
-                           f"Entry: `${entry:.2f}`\n"
-                           f"Stop Loss: `${sl:.2f}`\n"
-                           f"Take Profit (1:2): `${tp:.2f}`\n")
+                    msg = (f"{emoji} **GOLDEN QUANT ALERT** {emoji}\n\n"
+                           f"**Asset:** {GOLD_SYMBOL}\n"
+                           f"**Action:** {direction}\n"
+                           f"**Time:** {sig_datetime}\n\n"
+                           f"📊 **Indicators:**\n"
+                           f"• MACD: {direction} Crossover\n"
+                           f"• Trend: {'Above' if direction == 'LONG' else 'Below'} 200 EMA\n"
+                           f"• RSI: {rsi:.1f}\n"
+                           f"• Volatility (ATR): {atr:.2f}\n\n"
+                           f"⚡ **Trade Execution:**\n"
+                           f"• **Entry:** `${entry:.2f}`\n"
+                           f"• **Stop Loss:** `${sl:.2f}`\n"
+                           f"• **Take Profit:** `${tp:.2f}`\n"
+                           f"• **R:R:** 1:2")
                            
                     await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-                    last_signal_date = sig_date
-                    print(f"[ALERT] Sent {direction} signal for {sig_date}")
+                    last_signal_time = sig_time
+                    print(f"[ALERT] {direction} triggered at {sig_datetime}")
                     
         except Exception as e:
             print(f"[Scanner Error] {e}")
             
-        # Check every 1 minute
-        await asyncio.sleep(60)
+        # Scan every 30 seconds to catch the candle close promptly
+        await asyncio.sleep(30)
 
 # ==========================================
-# 5. TELEGRAM COMMANDS
+# 6. TELEGRAM COMMANDS
 # ==========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🗽 **NY Open Gold Bot Online.**\nMonitoring the 08:00 AM EST candle for liquidity sweeps.",
+        "⚙️ **Golden Quant Bot Online.**\nScanning the 15m chart with MACD, RSI, and ATR.",
         parse_mode='Markdown'
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ny_tz = pytz.timezone('America/New_York')
-    now_ny = datetime.now(ny_tz).strftime('%H:%M EST')
+    pkt_tz = pytz.timezone('Asia/Karachi')
+    now_pkt = datetime.now(pkt_tz).strftime('%I:%M %p PKT')
     
     msg = (
         f"📊 **SYSTEM STATUS**\n"
         f"------------------------\n"
-        f"🕒 NY Time: {now_ny}\n"
-        f"🔹 Target Asset: {GOLD_SYMBOL}\n"
-        f"🔹 Target Candle: 08:00 AM EST\n"
-        f"🔹 Strategy: 5m Sweep & Reversal\n"
+        f"🕒 Local Time: {now_pkt}\n"
+        f"🔹 Asset: {GOLD_SYMBOL}\n"
+        f"🔹 Timeframe: {TIMEFRAME}\n"
+        f"🔹 Strategy: EMA/MACD/RSI/ATR\n"
         f"🔹 Status: ✅ ACTIVE"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 # ==========================================
-# 6. MAIN EXECUTION
+# 7. MAIN EXECUTION
 # ==========================================
 
 async def main():
@@ -192,11 +210,13 @@ async def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
 
-    # Launch the dedicated Gold scanner
-    asyncio.create_task(gold_scanner(application))
+    # Launch the active quant scanner
+    asyncio.create_task(quant_scanner(application))
 
     await application.initialize()
     await application.start()
+    
+    # drop_pending_updates prevents conflict crashes on Render restarts
     await application.updater.start_polling(drop_pending_updates=True)
     await asyncio.Event().wait()
 
