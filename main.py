@@ -44,20 +44,20 @@ def keep_alive():
     Thread(target=run_http, daemon=True).start()
 
 # ==========================================
-# 3. QUANT INDICATOR MATH
+# 3. QUANT INDICATOR MATH (RELAXED)
 # ==========================================
 
 def calculate_indicators(df):
-    # 1. EMA 200 (Trend Filter)
-    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+    # 1. EMA 50 (Intraday Trend Filter - Relaxed from 200)
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
 
-    # 2. MACD (12, 26, 9) (Momentum)
-    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = df['ema12'] - df['ema26']
-    df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    # 2. Fast MACD (8, 21, 5) (Faster Momentum Reaction)
+    df['ema8'] = df['close'].ewm(span=8, adjust=False).mean()
+    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+    df['macd'] = df['ema8'] - df['ema21']
+    df['signal'] = df['macd'].ewm(span=5, adjust=False).mean()
 
-    # 3. RSI 14 (Overbought/Oversold Filter)
+    # 3. RSI 14
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -81,34 +81,35 @@ def calculate_indicators(df):
 
 def analyze_quant_gold(df):
     try:
-        if len(df) < 205: # Need enough data for the 200 EMA
+        if len(df) < 55: # Lowered requirement since we only need 50 candles now
             return None
             
         df = calculate_indicators(df)
         
-        # Look at the last fully closed candle (curr) and the one before it (prev) to detect crossovers
         curr = df.iloc[-2]
         prev = df.iloc[-3]
         
         close_price = curr['close']
-        ema200 = curr['ema200']
+        ema50 = curr['ema50'] # Now using 50 EMA
         rsi = curr['rsi']
         atr = curr['atr']
         c_time = curr['time']
 
-        # Check MACD Crossovers
+        # Check Fast MACD Crossovers
         bullish_macd_cross = (prev['macd'] <= prev['signal']) and (curr['macd'] > curr['signal'])
         bearish_macd_cross = (prev['macd'] >= prev['signal']) and (curr['macd'] < curr['signal'])
 
         # --- LONG ENTRY CONDITIONS ---
-        if bullish_macd_cross and (close_price > ema200) and (20 <= rsi <= 50):
+        # Price > 50 EMA, Fast MACD crosses up, RSI is oversold (20 to 40)
+        if bullish_macd_cross and (close_price > ema50) and (20 <= rsi <= 40):
             entry = close_price
             sl = entry - (1.5 * atr)
             tp = entry + (3.0 * atr)
             return ("LONG", entry, sl, tp, rsi, atr, c_time)
 
         # --- SHORT ENTRY CONDITIONS ---
-        if bearish_macd_cross and (close_price < ema200) and (50 <= rsi <= 80):
+        # Price < 50 EMA, Fast MACD crosses down, RSI is overbought (60 to 80)
+        if bearish_macd_cross and (close_price < ema50) and (60 <= rsi <= 80):
             entry = close_price
             sl = entry + (1.5 * atr)
             tp = entry - (3.0 * atr)
@@ -118,6 +119,7 @@ def analyze_quant_gold(df):
         print(f"[Strategy Error] {e}")
         
     return None
+
 
 # ==========================================
 # 5. BOT SCANNER LOOP
