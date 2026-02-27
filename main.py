@@ -101,14 +101,14 @@ def analyze_quant_gold(df):
         bearish_macd_cross = (prev['macd'] >= prev['signal']) and (curr['macd'] < curr['signal'])
 
         # --- LONG ENTRY CONDITIONS ---
-        if bullish_macd_cross and (close_price > ema200) and (40 <= rsi <= 65):
+        if bullish_macd_cross and (close_price > ema200) and (20 <= rsi <= 50):
             entry = close_price
             sl = entry - (1.5 * atr)
             tp = entry + (3.0 * atr)
             return ("LONG", entry, sl, tp, rsi, atr, c_time)
 
         # --- SHORT ENTRY CONDITIONS ---
-        if bearish_macd_cross and (close_price < ema200) and (35 <= rsi <= 60):
+        if bearish_macd_cross and (close_price < ema200) and (50 <= rsi <= 80):
             entry = close_price
             sl = entry + (1.5 * atr)
             tp = entry - (3.0 * atr)
