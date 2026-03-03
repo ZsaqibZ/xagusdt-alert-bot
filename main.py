@@ -44,20 +44,11 @@ def keep_alive():
     Thread(target=run_http, daemon=True).start()
 
 # ==========================================
-# 3. QUANT INDICATOR MATH (RELAXED)
+# 3. QUANT INDICATOR MATH (RSI & ATR ONLY)
 # ==========================================
 
 def calculate_indicators(df):
-    # 1. EMA 50 (Intraday Trend Filter - Relaxed from 200)
-    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-
-    # 2. Fast MACD (8, 21, 5) (Faster Momentum Reaction)
-    df['ema8'] = df['close'].ewm(span=8, adjust=False).mean()
-    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-    df['macd'] = df['ema8'] - df['ema21']
-    df['signal'] = df['macd'].ewm(span=5, adjust=False).mean()
-
-    # 3. RSI 14
+    # 1. RSI 14
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -66,7 +57,7 @@ def calculate_indicators(df):
     rs = avg_gain / avg_loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # 4. ATR 14 (Dynamic Risk Management)
+    # 2. ATR 14 (Dynamic Risk Management)
     df['tr0'] = abs(df['high'] - df['low'])
     df['tr1'] = abs(df['high'] - df['close'].shift(1))
     df['tr2'] = abs(df['low'] - df['close'].shift(1))
@@ -76,50 +67,47 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. STRATEGY LOGIC
+# 4. STRATEGY LOGIC (PURE RSI)
 # ==========================================
 
 def analyze_quant_gold(df):
     try:
-        if len(df) < 55: # Lowered requirement since we only need 50 candles now
+        # We only need enough candles to calculate the 14-period RSI and ATR
+        if len(df) < 15: 
             return None
             
         df = calculate_indicators(df)
         
+        # Look at the last fully closed candle (curr) and the one before it (prev)
         curr = df.iloc[-2]
         prev = df.iloc[-3]
         
         close_price = curr['close']
-        ema50 = curr['ema50'] # Now using 50 EMA
-        rsi = curr['rsi']
+        curr_rsi = curr['rsi']
+        prev_rsi = prev['rsi']
         atr = curr['atr']
         c_time = curr['time']
 
-        # Check Fast MACD Crossovers
-        bullish_macd_cross = (prev['macd'] <= prev['signal']) and (curr['macd'] > curr['signal'])
-        bearish_macd_cross = (prev['macd'] >= prev['signal']) and (curr['macd'] < curr['signal'])
-
         # --- LONG ENTRY CONDITIONS ---
-        # Price > 50 EMA, Fast MACD crosses up, RSI is oversold (20 to 40)
-        if bullish_macd_cross and (close_price > ema50) and (20 <= rsi <= 40):
+        # RSI dips into the 20-40 zone (and wasn't already there on the previous candle)
+        if (20 <= curr_rsi <= 40) and (prev_rsi > 40):
             entry = close_price
             sl = entry - (1.5 * atr)
             tp = entry + (3.0 * atr)
-            return ("LONG", entry, sl, tp, rsi, atr, c_time)
+            return ("LONG", entry, sl, tp, curr_rsi, atr, c_time)
 
         # --- SHORT ENTRY CONDITIONS ---
-        # Price < 50 EMA, Fast MACD crosses down, RSI is overbought (60 to 80)
-        if bearish_macd_cross and (close_price < ema50) and (60 <= rsi <= 80):
+        # RSI spikes into the 60-80 zone (and wasn't already there on the previous candle)
+        if (60 <= curr_rsi <= 80) and (prev_rsi < 60):
             entry = close_price
             sl = entry + (1.5 * atr)
             tp = entry - (3.0 * atr)
-            return ("SHORT", entry, sl, tp, rsi, atr, c_time)
+            return ("SHORT", entry, sl, tp, curr_rsi, atr, c_time)
 
     except Exception as e:
         print(f"[Strategy Error] {e}")
         
     return None
-
 
 # ==========================================
 # 5. BOT SCANNER LOOP
