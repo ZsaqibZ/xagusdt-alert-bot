@@ -89,7 +89,7 @@ def analyze_quant_gold(df):
 
         # --- LONG ENTRY CONDITIONS (Zone Scalp) ---
         # Alert if RSI is anywhere between 20 and 40
-        if 20 <= curr_rsi <= 40:
+        if 10 <= curr_rsi <= 30:
             entry = close_price
             sl = entry - (1.5 * atr)
             tp = entry + (3.0 * atr)
@@ -97,7 +97,7 @@ def analyze_quant_gold(df):
 
         # --- SHORT ENTRY CONDITIONS (Zone Scalp) ---
         # Alert if RSI is anywhere between 60 and 80
-        if 60 <= curr_rsi <= 80:
+        if 70 <= curr_rsi <= 90:
             entry = close_price
             sl = entry + (1.5 * atr)
             tp = entry - (3.0 * atr)
