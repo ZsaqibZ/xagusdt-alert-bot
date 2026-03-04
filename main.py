@@ -18,7 +18,8 @@ GOLD_SYMBOL = 'XAUT/USDT:USDT'
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-TIMEFRAME = '15m'
+# Changed to 5m to generate the requested 10-20 scalping signals per day
+TIMEFRAME = '15m' 
 last_signal_time = None
 
 # Exchange Setup
@@ -35,7 +36,7 @@ app = Flask('')
 
 @app.route('/')
 def home(): 
-    return "Golden Quant Bot is Running!"
+    return "Golden RSI Scalp Bot is Running!"
 
 def run_http(): 
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
@@ -67,42 +68,40 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. STRATEGY LOGIC (PURE RSI)
+# 4. STRATEGY LOGIC (PURE RSI SCALP)
 # ==========================================
 
 def analyze_quant_gold(df):
     try:
         # We only need enough candles to calculate the 14-period RSI and ATR
-        if len(df) < 15: 
+        if len(df) < 20: 
             return None
             
         df = calculate_indicators(df)
         
-        # Look at the last fully closed candle (curr) and the one before it (prev)
+        # Look at the last fully closed candle
         curr = df.iloc[-2]
-        prev = df.iloc[-3]
         
         close_price = curr['close']
         curr_rsi = curr['rsi']
-        prev_rsi = prev['rsi']
         atr = curr['atr']
-        c_time = curr['time']
+        sig_time = curr['time']
 
-        # --- LONG ENTRY CONDITIONS ---
-        # RSI dips into the 20-40 zone (and wasn't already there on the previous candle)
-        if (20 <= curr_rsi <= 40) and (prev_rsi > 40):
+        # --- LONG ENTRY CONDITIONS (Zone Scalp) ---
+        # Alert if RSI is anywhere between 20 and 40
+        if 20 <= curr_rsi <= 40:
             entry = close_price
             sl = entry - (1.5 * atr)
             tp = entry + (3.0 * atr)
-            return ("LONG", entry, sl, tp, curr_rsi, atr, c_time)
+            return ("LONG", entry, sl, tp, curr_rsi, atr, sig_time)
 
-        # --- SHORT ENTRY CONDITIONS ---
-        # RSI spikes into the 60-80 zone (and wasn't already there on the previous candle)
-        if (60 <= curr_rsi <= 80) and (prev_rsi < 60):
+        # --- SHORT ENTRY CONDITIONS (Zone Scalp) ---
+        # Alert if RSI is anywhere between 60 and 80
+        if 60 <= curr_rsi <= 80:
             entry = close_price
             sl = entry + (1.5 * atr)
             tp = entry - (3.0 * atr)
-            return ("SHORT", entry, sl, tp, curr_rsi, atr, c_time)
+            return ("SHORT", entry, sl, tp, curr_rsi, atr, sig_time)
 
     except Exception as e:
         print(f"[Strategy Error] {e}")
@@ -115,14 +114,14 @@ def analyze_quant_gold(df):
 
 async def quant_scanner(application):
     global last_signal_time
-    print(f"⚙️ Golden Quant Strategy Started. Scanning {GOLD_SYMBOL} on {TIMEFRAME}...")
+    print(f"⚙️ Golden RSI Scalp Strategy Started. Scanning {GOLD_SYMBOL} on {TIMEFRAME}...")
     
     # Set timezone to Pakistan Standard Time (PKT) for logging
     pkt_tz = pytz.timezone('Asia/Karachi')
     
     while True:
         try:
-            bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe=TIMEFRAME, limit=250)
+            bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe=TIMEFRAME, limit=100)
             if not bars:
                 await asyncio.sleep(20)
                 continue
@@ -139,14 +138,12 @@ async def quant_scanner(application):
                     sig_datetime = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d %I:%M %p PKT')
                     emoji = "🔴" if direction == "SHORT" else "🟢"
                     
-                    msg = (f"{emoji} **GOLDEN QUANT ALERT** {emoji}\n\n"
+                    msg = (f"{emoji} **GOLDEN RSI SCALP** {emoji}\n\n"
                            f"**Asset:** {GOLD_SYMBOL}\n"
                            f"**Action:** {direction}\n"
                            f"**Time:** {sig_datetime}\n\n"
                            f"📊 **Indicators:**\n"
-                           f"• MACD: {direction} Crossover\n"
-                           f"• Trend: {'Above' if direction == 'LONG' else 'Below'} 200 EMA\n"
-                           f"• RSI: {rsi:.1f}\n"
+                           f"• RSI: {rsi:.1f} (Zone Entry)\n"
                            f"• Volatility (ATR): {atr:.2f}\n\n"
                            f"⚡ **Trade Execution:**\n"
                            f"• **Entry:** `${entry:.2f}`\n"
@@ -161,8 +158,8 @@ async def quant_scanner(application):
         except Exception as e:
             print(f"[Scanner Error] {e}")
             
-        # Scan every 30 seconds to catch the candle close promptly
-        await asyncio.sleep(30)
+        # Scan every 15 seconds to stay sharp on smaller timeframes
+        await asyncio.sleep(15)
 
 # ==========================================
 # 6. TELEGRAM COMMANDS
@@ -170,7 +167,7 @@ async def quant_scanner(application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚙️ **Golden Quant Bot Online.**\nScanning the 15m chart with MACD, RSI, and ATR.",
+        "⚙️ **Golden RSI Scalp Bot Online.**\nScanning the 5m chart for RSI overbought/oversold zones.",
         parse_mode='Markdown'
     )
 
@@ -184,7 +181,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🕒 Local Time: {now_pkt}\n"
         f"🔹 Asset: {GOLD_SYMBOL}\n"
         f"🔹 Timeframe: {TIMEFRAME}\n"
-        f"🔹 Strategy: EMA/MACD/RSI/ATR\n"
+        f"🔹 Strategy: Pure RSI Zone Scalper\n"
         f"🔹 Status: ✅ ACTIVE"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
