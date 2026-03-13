@@ -18,7 +18,6 @@ GOLD_SYMBOL = 'XAUT/USDT:USDT'
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Changed to 5m to generate the requested 10-20 scalping signals per day
 TIMEFRAME = '15m' 
 last_signal_time = None
 
@@ -36,7 +35,7 @@ app = Flask('')
 
 @app.route('/')
 def home(): 
-    return "Golden RSI Scalp Bot is Running!"
+    return "Pine Script Translation Bot is Running!"
 
 def run_http(): 
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
@@ -45,11 +44,15 @@ def keep_alive():
     Thread(target=run_http, daemon=True).start()
 
 # ==========================================
-# 3. QUANT INDICATOR MATH (RSI & ATR ONLY)
+# 3. QUANT INDICATOR MATH
 # ==========================================
 
 def calculate_indicators(df):
-    # 1. RSI 14
+    # 1. EMAs (50 and 200)
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+
+    # 2. RSI 14
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -58,7 +61,7 @@ def calculate_indicators(df):
     rs = avg_gain / avg_loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # 2. ATR 14 (Dynamic Risk Management)
+    # 3. ATR 14
     df['tr0'] = abs(df['high'] - df['low'])
     df['tr1'] = abs(df['high'] - df['close'].shift(1))
     df['tr2'] = abs(df['low'] - df['close'].shift(1))
@@ -68,40 +71,58 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. STRATEGY LOGIC (PURE RSI SCALP)
+# 4. STRATEGY LOGIC (PINE SCRIPT TRANSLATION)
 # ==========================================
 
 def analyze_quant_gold(df):
     try:
-        # We only need enough candles to calculate the 14-period RSI and ATR
-        if len(df) < 20: 
+        # Need at least 205 candles to accurately calculate the 200 EMA
+        if len(df) < 205: 
             return None
             
         df = calculate_indicators(df)
         
-        # Look at the last fully closed candle
+        # Look at the last fully closed candle (curr) and the one before it (prev)
         curr = df.iloc[-2]
+        prev = df.iloc[-3]
         
         close_price = curr['close']
-        curr_rsi = curr['rsi']
+        prev_close = prev['close']
+        
+        ema50 = curr['ema50']
+        prev_ema50 = prev['ema50']
+        ema200 = curr['ema200']
+        
+        rsi = curr['rsi']
         atr = curr['atr']
-        sig_time = curr['time']
+        c_time_ms = curr['time']
 
-        # --- LONG ENTRY CONDITIONS (Zone Scalp) ---
-        # Alert if RSI is anywhere between 20 and 40
-        if 10 <= curr_rsi <= 30:
-            entry = close_price
-            sl = entry - (1.5 * atr)
-            tp = entry + (3.0 * atr)
-            return ("LONG", entry, sl, tp, curr_rsi, atr, sig_time)
+        # --- TIME SESSION FILTER ---
+        # Pine Script: input.session("0300-1200", "UTC")
+        candle_dt_utc = datetime.fromtimestamp(c_time_ms / 1000, tz=pytz.UTC)
+        in_session = 3 <= candle_dt_utc.hour < 12 
+        
+        if not in_session:
+            return None # Ignore setups outside of the London/Early NY session
 
-        # --- SHORT ENTRY CONDITIONS (Zone Scalp) ---
-        # Alert if RSI is anywhere between 60 and 80
-        if 70 <= curr_rsi <= 90:
+        # --- ENTRY TRIGGERS ---
+        # Did the price cross the 50 EMA on this exact candle?
+        cross_above_ema50 = (prev_close <= prev_ema50) and (close_price > ema50)
+        cross_below_ema50 = (prev_close >= prev_ema50) and (close_price < ema50)
+
+        # LONG: 50 > 200 (Uptrend), crosses above 50 EMA, RSI > 50
+        if (ema50 > ema200) and cross_above_ema50 and (rsi > 50):
             entry = close_price
-            sl = entry + (1.5 * atr)
-            tp = entry - (3.0 * atr)
-            return ("SHORT", entry, sl, tp, curr_rsi, atr, sig_time)
+            tp = entry + (atr * 1.0) # 1.0 ATR Multiplier
+            sl = entry - (atr * 3.5) # 3.5 ATR Multiplier
+            return ("LONG", entry, sl, tp, rsi, atr, c_time_ms)
+
+        # SHORT: 50 < 200 (Downtrend), crosses below 50 EMA, RSI < 50
+        if (ema50 < ema200) and cross_below_ema50 and (rsi < 50):
+            entry = close_price
+            tp = entry - (atr * 1.0) # 1.0 ATR Multiplier
+            sl = entry + (atr * 3.5) # 3.5 ATR Multiplier
+            return ("SHORT", entry, sl, tp, rsi, atr, c_time_ms)
 
     except Exception as e:
         print(f"[Strategy Error] {e}")
@@ -114,14 +135,13 @@ def analyze_quant_gold(df):
 
 async def quant_scanner(application):
     global last_signal_time
-    print(f"⚙️ Golden RSI Scalp Strategy Started. Scanning {GOLD_SYMBOL} on {TIMEFRAME}...")
+    print(f"⚙️ Pine Script Strategy Started. Scanning {GOLD_SYMBOL} on {TIMEFRAME}...")
     
-    # Set timezone to Pakistan Standard Time (PKT) for logging
     pkt_tz = pytz.timezone('Asia/Karachi')
     
     while True:
         try:
-            bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe=TIMEFRAME, limit=100)
+            bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe=TIMEFRAME, limit=250)
             if not bars:
                 await asyncio.sleep(20)
                 continue
@@ -133,23 +153,23 @@ async def quant_scanner(application):
             if signal:
                 direction, entry, sl, tp, rsi, atr, sig_time = signal
                 
-                # Prevent duplicate alerts for the exact same closed candle
+                # Prevent duplicate alerts
                 if last_signal_time != sig_time:
                     sig_datetime = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d %I:%M %p PKT')
                     emoji = "🔴" if direction == "SHORT" else "🟢"
                     
-                    msg = (f"{emoji} **GOLDEN RSI SCALP** {emoji}\n\n"
+                    msg = (f"{emoji} **GOLD TREND PULLBACK** {emoji}\n\n"
                            f"**Asset:** {GOLD_SYMBOL}\n"
                            f"**Action:** {direction}\n"
                            f"**Time:** {sig_datetime}\n\n"
-                           f"📊 **Indicators:**\n"
-                           f"• RSI: {rsi:.1f} (Zone Entry)\n"
-                           f"• Volatility (ATR): {atr:.2f}\n\n"
+                           f"📊 **Strategy Confluences:**\n"
+                           f"• Setup: Price Snap-Back (50 EMA)\n"
+                           f"• Trend Guard: 200 EMA Passed\n"
+                           f"• Momentum: RSI {rsi:.1f}\n\n"
                            f"⚡ **Trade Execution:**\n"
                            f"• **Entry:** `${entry:.2f}`\n"
-                           f"• **Stop Loss:** `${sl:.2f}`\n"
-                           f"• **Take Profit:** `${tp:.2f}`\n"
-                           f"• **R:R:** 1:2")
+                           f"• **Take Profit (1.0x ATR):** `${tp:.2f}`\n"
+                           f"• **Stop Loss (3.5x ATR):** `${sl:.2f}`\n")
                            
                     await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
                     last_signal_time = sig_time
@@ -158,8 +178,7 @@ async def quant_scanner(application):
         except Exception as e:
             print(f"[Scanner Error] {e}")
             
-        # Scan every 15 seconds to stay sharp on smaller timeframes
-        await asyncio.sleep(15)
+        await asyncio.sleep(30)
 
 # ==========================================
 # 6. TELEGRAM COMMANDS
@@ -167,7 +186,7 @@ async def quant_scanner(application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚙️ **Golden RSI Scalp Bot Online.**\nScanning the 5m chart for RSI overbought/oversold zones.",
+        "⚙️ **Pine Script Gold Bot Online.**\nScanning the 15m chart during London/NY sessions.",
         parse_mode='Markdown'
     )
 
@@ -181,7 +200,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🕒 Local Time: {now_pkt}\n"
         f"🔹 Asset: {GOLD_SYMBOL}\n"
         f"🔹 Timeframe: {TIMEFRAME}\n"
-        f"🔹 Strategy: Pure RSI Zone Scalper\n"
+        f"🔹 Strategy: 50/200 EMA Pullback\n"
         f"🔹 Status: ✅ ACTIVE"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
@@ -197,13 +216,10 @@ async def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
 
-    # Launch the active quant scanner
     asyncio.create_task(quant_scanner(application))
 
     await application.initialize()
     await application.start()
-    
-    # drop_pending_updates prevents conflict crashes on Render restarts
     await application.updater.start_polling(drop_pending_updates=True)
     await asyncio.Event().wait()
 
