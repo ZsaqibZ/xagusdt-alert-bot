@@ -141,7 +141,7 @@ async def quant_scanner(application):
     
     while True:
         try:
-            bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe=TIMEFRAME, limit=250)
+            bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe=TIMEFRAME, limit=1000)
             if not bars:
                 await asyncio.sleep(20)
                 continue
