@@ -1,7 +1,6 @@
 import os
 import ccxt.async_support as ccxt
 import pandas as pd
-import numpy as np
 import asyncio
 import pytz
 from datetime import datetime
@@ -14,17 +13,19 @@ from threading import Thread
 # 1. CONFIGURATION
 # ==========================================
 
-GOLD_SYMBOL = 'XAUT/USDT:USDT'
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-TIMEFRAME = '15m' 
-last_signal_time = None
+TIMEFRAME = '1d' # Daily timeframe for Swing Trading
+LOOKBACK_PERIOD = 30 # Look for the lowest low of the last 30 days
+TOP_PAIRS_COUNT = 150 # Number of top volume pairs to scan
 
-# Exchange Setup
+last_signals = {} # To prevent duplicate alerts
+
+# Exchange Setup (SPOT MARKET)
 exchange = ccxt.mexc({
     'enableRateLimit': True,
-    'options': {'defaultType': 'swap'}
+    'options': {'defaultType': 'spot'} # Strictly Spot Market
 })
 
 # ==========================================
@@ -35,7 +36,7 @@ app = Flask('')
 
 @app.route('/')
 def home(): 
-    return "Pine Script Translation Bot is Running!"
+    return "Spot Swing Sweep Bot is Running!"
 
 def run_http(): 
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
@@ -44,88 +45,74 @@ def keep_alive():
     Thread(target=run_http, daemon=True).start()
 
 # ==========================================
-# 3. QUANT INDICATOR MATH
+# 3. GET TOP SPOT MARKETS
 # ==========================================
 
-def calculate_indicators(df):
-    # 1. EMAs (50 and 200)
-    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
-
-    # 2. RSI 14
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-
-    # 3. ATR 14
-    df['tr0'] = abs(df['high'] - df['low'])
-    df['tr1'] = abs(df['high'] - df['close'].shift(1))
-    df['tr2'] = abs(df['low'] - df['close'].shift(1))
-    df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
-    df['atr'] = df['tr'].rolling(window=14).mean()
-    
-    return df
-
-# ==========================================
-# 4. STRATEGY LOGIC (PINE SCRIPT TRANSLATION)
-# ==========================================
-
-def analyze_quant_gold(df):
+async def get_top_spot_pairs():
+    """Fetches the top USDT spot pairs by trading volume to ensure liquidity."""
     try:
-        # Need at least 205 candles to accurately calculate the 200 EMA
-        if len(df) < 205: 
+        print("Fetching latest top spot markets by volume...")
+        markets = await exchange.load_markets()
+        tickers = await exchange.fetch_tickers()
+        
+        usdt_pairs = []
+        for symbol, ticker in tickers.items():
+            # Filter for pure spot USDT pairs (no leveraged tokens like 3L/3S, no futures)
+            if symbol.endswith('/USDT') and ':' not in symbol and '3L' not in symbol and '3S' not in symbol:
+                if ticker.get('quoteVolume') is not None:
+                    usdt_pairs.append({'symbol': symbol, 'vol': ticker['quoteVolume']})
+                    
+        # Sort by volume and slice the top N pairs
+        usdt_pairs.sort(key=lambda x: x['vol'], reverse=True)
+        top_symbols = [pair['symbol'] for pair in usdt_pairs[:TOP_PAIRS_COUNT]]
+        
+        print(f"✅ Successfully loaded {len(top_symbols)} highly liquid spot pairs.")
+        return top_symbols
+    except Exception as e:
+        print(f"[Market Fetch Error] {e}")
+        return []
+
+# ==========================================
+# 4. STRATEGY LOGIC (BULLISH SWEEP)
+# ==========================================
+
+def analyze_spot_sweep(df):
+    try:
+        # We need enough history for the lookback period
+        if len(df) < LOOKBACK_PERIOD + 5: 
             return None
             
-        df = calculate_indicators(df)
-        
-        # Look at the last fully closed candle (curr) and the one before it (prev)
+        # curr = Last fully closed daily candle
         curr = df.iloc[-2]
-        prev = df.iloc[-3]
         
-        close_price = curr['close']
-        prev_close = prev['close']
+        # prev_data = The 30 days BEFORE the trigger candle
+        prev_data = df.iloc[-(LOOKBACK_PERIOD + 2):-2]
         
-        ema50 = curr['ema50']
-        prev_ema50 = prev['ema50']
-        ema200 = curr['ema200']
+        swing_low = prev_data['low'].min()
         
-        rsi = curr['rsi']
-        atr = curr['atr']
-        c_time_ms = curr['time']
+        curr_low = curr['low']
+        curr_close = curr['close']
+        curr_open = curr['open']
+        sig_time = curr['time']
 
-        # --- TIME SESSION FILTER ---
-        # Pine Script: input.session("0300-1200", "UTC")
-        candle_dt_utc = datetime.fromtimestamp(c_time_ms / 1000, tz=pytz.UTC)
-        in_session = 3 <= candle_dt_utc.hour < 12 
-        
-        if not in_session:
-            return None # Ignore setups outside of the London/Early NY session
-
-        # --- ENTRY TRIGGERS ---
-        # Did the price cross the 50 EMA on this exact candle?
-        cross_above_ema50 = (prev_close <= prev_ema50) and (close_price > ema50)
-        cross_below_ema50 = (prev_close >= prev_ema50) and (close_price < ema50)
-
-        # LONG: 50 > 200 (Uptrend), crosses above 50 EMA, RSI > 50
-        if (ema50 > ema200) and cross_above_ema50 and (rsi > 50):
-            entry = close_price
-            tp = entry + (atr * 1.0) # 1.0 ATR Multiplier
-            sl = entry - (atr * 3.5) # 3.5 ATR Multiplier
-            return ("LONG", entry, sl, tp, rsi, atr, c_time_ms)
-
-        # SHORT: 50 < 200 (Downtrend), crosses below 50 EMA, RSI < 50
-        if (ema50 < ema200) and cross_below_ema50 and (rsi < 50):
-            entry = close_price
-            tp = entry - (atr * 1.0) # 1.0 ATR Multiplier
-            sl = entry + (atr * 3.5) # 3.5 ATR Multiplier
-            return ("SHORT", entry, sl, tp, rsi, atr, c_time_ms)
+        # --- BULLISH LIQUIDITY SWEEP LOGIC ---
+        # 1. The daily wick must go below the 30-day swing low
+        # 2. The daily close must recover and close ABOVE the swing low
+        # 3. The candle should ideally close green (Close > Open) for added momentum
+        if (curr_low < swing_low) and (curr_close > swing_low) and (curr_close > curr_open):
+            
+            entry = curr_close
+            # Stop Loss is placed slightly below the actual sweep wick
+            sl = curr_low * 0.98 
+            
+            # Take Profit set to a 1:2 Risk/Reward ratio for stable portfolio growth
+            risk = entry - sl
+            tp = entry + (risk * 2) 
+            
+            return (entry, sl, tp, swing_low, sig_time)
 
     except Exception as e:
-        print(f"[Strategy Error] {e}")
+        pass
         
     return None
 
@@ -133,52 +120,66 @@ def analyze_quant_gold(df):
 # 5. BOT SCANNER LOOP
 # ==========================================
 
-async def quant_scanner(application):
-    global last_signal_time
-    print(f"⚙️ Pine Script Strategy Started. Scanning {GOLD_SYMBOL} on {TIMEFRAME}...")
+async def swing_scanner(application):
+    print(f"🦅 Spot Swing Sweep Strategy Started. Timeframe: {TIMEFRAME}...")
     
     pkt_tz = pytz.timezone('Asia/Karachi')
     
     while True:
-        try:
-            bars = await exchange.fetch_ohlcv(GOLD_SYMBOL, timeframe=TIMEFRAME, limit=1000)
-            if not bars:
-                await asyncio.sleep(20)
-                continue
-                
-            df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        symbols = await get_top_spot_pairs()
+        
+        if not symbols:
+            await asyncio.sleep(60)
+            continue
             
-            signal = analyze_quant_gold(df)
-            
-            if signal:
-                direction, entry, sl, tp, rsi, atr, sig_time = signal
-                
-                # Prevent duplicate alerts
-                if last_signal_time != sig_time:
-                    sig_datetime = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d %I:%M %p PKT')
-                    emoji = "🔴" if direction == "SHORT" else "🟢"
+        print(f"Starting daily sweep scan across {len(symbols)} pairs...")
+        
+        for symbol in symbols:
+            try:
+                # Fetch daily data
+                bars = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=40)
+                if not bars:
+                    continue
                     
-                    msg = (f"{emoji} **GOLD TREND PULLBACK** {emoji}\n\n"
-                           f"**Asset:** {GOLD_SYMBOL}\n"
-                           f"**Action:** {direction}\n"
-                           f"**Time:** {sig_datetime}\n\n"
-                           f"📊 **Strategy Confluences:**\n"
-                           f"• Setup: Price Snap-Back (50 EMA)\n"
-                           f"• Trend Guard: 200 EMA Passed\n"
-                           f"• Momentum: RSI {rsi:.1f}\n\n"
-                           f"⚡ **Trade Execution:**\n"
-                           f"• **Entry:** `${entry:.2f}`\n"
-                           f"• **Take Profit (1.0x ATR):** `${tp:.2f}`\n"
-                           f"• **Stop Loss (3.5x ATR):** `${sl:.2f}`\n")
-                           
-                    await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-                    last_signal_time = sig_time
-                    print(f"[ALERT] {direction} triggered at {sig_datetime}")
+                df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+                
+                signal = analyze_spot_sweep(df)
+                
+                if signal:
+                    entry, sl, tp, swing_low, sig_time = signal
+                    sig_id = f"{symbol}_{sig_time}"
                     
-        except Exception as e:
-            print(f"[Scanner Error] {e}")
-            
-        await asyncio.sleep(30)
+                    # Prevent duplicate alerts for the same candle
+                    if sig_id not in last_signals:
+                        sig_datetime = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d PKT')
+                        
+                        msg = (f"🟢 **SPOT LIQUIDITY SWEEP** 🟢\n\n"
+                               f"**Asset:** {symbol} (Spot)\n"
+                               f"**Date:** {sig_datetime}\n\n"
+                               f"📊 **Setup Details:**\n"
+                               f"• 30-Day Low Swept: `${swing_low:.4f}`\n"
+                               f"• Daily Rejection Confirmed\n\n"
+                               f"⚡ **Swing Trade Plan:**\n"
+                               f"• **Buy Entry:** `${entry:.4f}`\n"
+                               f"• **Stop Loss:** `${sl:.4f}`\n"
+                               f"• **Target (1:2):** `${tp:.4f}`\n\n"
+                               f"💡 *Note: Spot trade. Buy the asset and set an OCO/Stop-Limit order.*")
+                               
+                        await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
+                        last_signals[sig_id] = True
+                        print(f"[ALERT] Bullish Sweep on {symbol}")
+                        
+                # Respect exchange rate limits when scanning hundreds of pairs
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                # Fail silently for individual bad pairs to keep the loop running
+                await asyncio.sleep(0.5)
+                
+        # Since this is a Daily timeframe strategy, the bot will scan all 150 pairs,
+        # then sleep for 30 minutes before checking again.
+        print("✅ Scan complete. Sleeping for 30 minutes...")
+        await asyncio.sleep(1800) 
 
 # ==========================================
 # 6. TELEGRAM COMMANDS
@@ -186,7 +187,7 @@ async def quant_scanner(application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚙️ **Pine Script Gold Bot Online.**\nScanning the 15m chart during London/NY sessions.",
+        "🦅 **Spot Swing Bot Online.**\nScanning the top 150 crypto pairs on the Daily chart for liquidity sweeps.",
         parse_mode='Markdown'
     )
 
@@ -198,9 +199,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 **SYSTEM STATUS**\n"
         f"------------------------\n"
         f"🕒 Local Time: {now_pkt}\n"
-        f"🔹 Asset: {GOLD_SYMBOL}\n"
-        f"🔹 Timeframe: {TIMEFRAME}\n"
-        f"🔹 Strategy: 50/200 EMA Pullback\n"
+        f"🔹 Market: MEXC Spot\n"
+        f"🔹 Scope: Top 150 Volume Pairs\n"
+        f"🔹 Timeframe: 1d (Daily)\n"
+        f"🔹 Strategy: 30-Day Bullish Sweep\n"
         f"🔹 Status: ✅ ACTIVE"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
@@ -216,7 +218,7 @@ async def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
 
-    asyncio.create_task(quant_scanner(application))
+    asyncio.create_task(swing_scanner(application))
 
     await application.initialize()
     await application.start()
