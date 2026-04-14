@@ -13,30 +13,30 @@ from threading import Thread
 # 1. CONFIGURATION
 # ==========================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+CHAT_ID = "YOUR_TELEGRAM_CHAT_ID_HERE"
 
-TIMEFRAME = '1d' # Daily timeframe for Swing Trading
-LOOKBACK_PERIOD = 30 # Look for the lowest low of the last 30 days
-TOP_PAIRS_COUNT = 150 # Number of top volume pairs to scan
+TIMEFRAME = '4h'            # 4-hour candles
+LOOKBACK_PERIOD = 180       # 180 candles (30 days of 4h candles)
+TOP_PAIRS_COUNT = 100       # Top 100 volume coins
 
-last_signals = {} # To prevent duplicate alerts
+last_signals = {}           # To prevent duplicate alerts
 
-# Exchange Setup (SPOT MARKET)
-exchange = ccxt.mexc({
+# Exchange Setup (BINANCE SPOT MARKET)
+exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'} # Strictly Spot Market
 })
 
 # ==========================================
-# 2. RENDER KEEP-ALIVE SERVER
+# 2. RENDER KEEP-ALIVE SERVER (Optional)
 # ==========================================
 
 app = Flask('')
 
 @app.route('/')
 def home(): 
-    return "Spot Swing Sweep Bot is Running!"
+    return "Binance 4H Spot Sweep Bot is Running!"
 
 def run_http(): 
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
@@ -45,24 +45,25 @@ def keep_alive():
     Thread(target=run_http, daemon=True).start()
 
 # ==========================================
-# 3. GET TOP SPOT MARKETS
+# 3. GET TOP SPOT MARKETS (BINANCE)
 # ==========================================
 
 async def get_top_spot_pairs():
-    """Fetches the top USDT spot pairs by trading volume to ensure liquidity."""
+    """Fetches the top USDT spot pairs by trading volume on Binance."""
     try:
-        print("Fetching latest top spot markets by volume...")
+        print("Fetching latest top spot markets by volume on Binance...")
         markets = await exchange.load_markets()
         tickers = await exchange.fetch_tickers()
         
         usdt_pairs = []
         for symbol, ticker in tickers.items():
-            # Filter for pure spot USDT pairs (no leveraged tokens like 3L/3S, no futures)
-            if symbol.endswith('/USDT') and ':' not in symbol and '3L' not in symbol and '3S' not in symbol:
+            # Filter for pure spot USDT pairs
+            # Exclude Binance leveraged tokens (UP/DOWN)
+            if symbol.endswith('/USDT') and not any(sub in symbol for sub in ['UP/', 'DOWN/', 'BULL/', 'BEAR/']):
                 if ticker.get('quoteVolume') is not None:
                     usdt_pairs.append({'symbol': symbol, 'vol': ticker['quoteVolume']})
                     
-        # Sort by volume and slice the top N pairs
+        # Sort by volume and slice the top 100 pairs
         usdt_pairs.sort(key=lambda x: x['vol'], reverse=True)
         top_symbols = [pair['symbol'] for pair in usdt_pairs[:TOP_PAIRS_COUNT]]
         
@@ -78,14 +79,14 @@ async def get_top_spot_pairs():
 
 def analyze_spot_sweep(df):
     try:
-        # We need enough history for the lookback period
+        # We need enough history for the 180 lookback period
         if len(df) < LOOKBACK_PERIOD + 5: 
             return None
             
-        # curr = Last fully closed daily candle
+        # curr = Last fully closed 4h candle
         curr = df.iloc[-2]
         
-        # prev_data = The 30 days BEFORE the trigger candle
+        # prev_data = The 180 candles BEFORE the trigger candle
         prev_data = df.iloc[-(LOOKBACK_PERIOD + 2):-2]
         
         swing_low = prev_data['low'].min()
@@ -96,8 +97,8 @@ def analyze_spot_sweep(df):
         sig_time = curr['time']
 
         # --- BULLISH LIQUIDITY SWEEP LOGIC ---
-        # 1. The daily wick must go below the 30-day swing low
-        # 2. The daily close must recover and close ABOVE the swing low
+        # 1. The 4h wick must go below the 180-candle swing low
+        # 2. The 4h close must recover and close ABOVE the swing low
         # 3. The candle should ideally close green (Close > Open) for added momentum
         if (curr_low < swing_low) and (curr_close > swing_low) and (curr_close > curr_open):
             
@@ -121,8 +122,9 @@ def analyze_spot_sweep(df):
 # ==========================================
 
 async def swing_scanner(application):
-    print(f"🦅 Spot Swing Sweep Strategy Started. Timeframe: {TIMEFRAME}...")
+    print(f"🦅 Binance Spot Sweep Strategy Started. Timeframe: {TIMEFRAME}...")
     
+    # Strictly setting timezone to Pakistan Standard Time (UTC+5)
     pkt_tz = pytz.timezone('Asia/Karachi')
     
     while True:
@@ -132,12 +134,13 @@ async def swing_scanner(application):
             await asyncio.sleep(60)
             continue
             
-        print(f"Starting daily sweep scan across {len(symbols)} pairs...")
+        now_pkt = datetime.now(pkt_tz).strftime('%I:%M %p PKT')
+        print(f"[{now_pkt}] Starting 4h sweep scan across top {len(symbols)} pairs...")
         
         for symbol in symbols:
             try:
-                # Fetch daily data
-                bars = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=40)
+                # Fetch enough 4h data to cover the 180 lookback period + padding
+                bars = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=200)
                 if not bars:
                     continue
                     
@@ -151,14 +154,14 @@ async def swing_scanner(application):
                     
                     # Prevent duplicate alerts for the same candle
                     if sig_id not in last_signals:
-                        sig_datetime = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d PKT')
+                        sig_datetime = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d %I:%M %p PKT')
                         
-                        msg = (f"🟢 **SPOT LIQUIDITY SWEEP** 🟢\n\n"
-                               f"**Asset:** {symbol} (Spot)\n"
-                               f"**Date:** {sig_datetime}\n\n"
+                        msg = (f"🟢 **BINANCE SPOT SWEEP** 🟢\n\n"
+                               f"**Asset:** {symbol}\n"
+                               f"**Time:** {sig_datetime}\n\n"
                                f"📊 **Setup Details:**\n"
-                               f"• 30-Day Low Swept: `${swing_low:.4f}`\n"
-                               f"• Daily Rejection Confirmed\n\n"
+                               f"• 180-Candle Low Swept: `${swing_low:.4f}`\n"
+                               f"• 4H Rejection Confirmed\n\n"
                                f"⚡ **Swing Trade Plan:**\n"
                                f"• **Buy Entry:** `${entry:.4f}`\n"
                                f"• **Stop Loss:** `${sl:.4f}`\n"
@@ -167,19 +170,18 @@ async def swing_scanner(application):
                                
                         await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
                         last_signals[sig_id] = True
-                        print(f"[ALERT] Bullish Sweep on {symbol}")
+                        print(f"[ALERT] Bullish Sweep on {symbol} at {sig_datetime}")
                         
-                # Respect exchange rate limits when scanning hundreds of pairs
+                # Respect Binance rate limits when scanning 100 pairs
                 await asyncio.sleep(0.1)
                 
             except Exception as e:
-                # Fail silently for individual bad pairs to keep the loop running
                 await asyncio.sleep(0.5)
                 
-        # Since this is a Daily timeframe strategy, the bot will scan all 150 pairs,
-        # then sleep for 30 minutes before checking again.
-        print("✅ Scan complete. Sleeping for 30 minutes...")
-        await asyncio.sleep(1800) 
+        # Since 4h candles close every 4 hours, checking every 15 minutes 
+        # ensures we catch the close promptly without spamming the API.
+        print("✅ Scan complete. Sleeping for 15 minutes...")
+        await asyncio.sleep(900) 
 
 # ==========================================
 # 6. TELEGRAM COMMANDS
@@ -187,7 +189,7 @@ async def swing_scanner(application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🦅 **Spot Swing Bot Online.**\nScanning the top 150 crypto pairs on the Daily chart for liquidity sweeps.",
+        "🦅 **Binance Spot Swing Bot Online.**\nScanning the top 100 crypto pairs on the 4H chart for liquidity sweeps.",
         parse_mode='Markdown'
     )
 
@@ -199,10 +201,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 **SYSTEM STATUS**\n"
         f"------------------------\n"
         f"🕒 Local Time: {now_pkt}\n"
-        f"🔹 Market: MEXC Spot\n"
-        f"🔹 Scope: Top 150 Volume Pairs\n"
-        f"🔹 Timeframe: 1d (Daily)\n"
-        f"🔹 Strategy: 30-Day Bullish Sweep\n"
+        f"🔹 Market: Binance Spot\n"
+        f"🔹 Scope: Top 100 Volume Pairs\n"
+        f"🔹 Timeframe: 4h\n"
+        f"🔹 Strategy: 180-Candle Bullish Sweep\n"
         f"🔹 Status: ✅ ACTIVE"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
@@ -212,6 +214,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 
 async def main():
+    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE" or CHAT_ID == "YOUR_TELEGRAM_CHAT_ID_HERE":
+        print("❌ ERROR: Please insert your Telegram BOT_TOKEN and CHAT_ID at the top of main.py!")
+        return
+
+    # Optional keep-alive for Render/cloud deployment
     keep_alive()
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -222,8 +229,14 @@ async def main():
 
     await application.initialize()
     await application.start()
+    
+    print("✅ Bot is successfully connected to Telegram and running.")
     await application.updater.start_polling(drop_pending_updates=True)
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
+    # Fix for Windows asyncio loop policy
+    import sys
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
