@@ -13,8 +13,9 @@ from threading import Thread
 # 1. CONFIGURATION
 # ==========================================
 
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-CHAT_ID = "YOUR_TELEGRAM_CHAT_ID_HERE"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+
 
 TIMEFRAME = '4h'            # 4-hour candles
 LOOKBACK_PERIOD = 180       # 180 candles (30 days of 4h candles)
