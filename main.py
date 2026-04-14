@@ -215,8 +215,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 
 async def main():
-    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE" or CHAT_ID == "YOUR_TELEGRAM_CHAT_ID_HERE":
-        print("❌ ERROR: Please insert your Telegram BOT_TOKEN and CHAT_ID at the top of main.py!")
+    if not BOT_TOKEN or not CHAT_ID:
+        print("❌ ERROR: BOT_TOKEN or CHAT_ID environment variables are missing!")
         return
 
     # Optional keep-alive for Render/cloud deployment
@@ -236,8 +236,4 @@ async def main():
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
-    # Fix for Windows asyncio loop policy
-    import sys
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
