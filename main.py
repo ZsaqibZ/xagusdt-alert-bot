@@ -149,7 +149,7 @@ async def swing_scanner(application):
     pkt_tz = pytz.timezone('Asia/Karachi')
     
     while True:
-        symbols = await get_top_spot_pairs()
+        symbols = SYMBOLS_RAW
         
         if not symbols:
             await asyncio.sleep(60)
