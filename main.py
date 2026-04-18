@@ -57,79 +57,86 @@ def run_http(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 def keep_alive(): Thread(target=run_http, daemon=True).start()
 
 # ==========================================
-# 4. STRATEGY LOGIC
+# 3. STRATEGY LOGIC (BI-DIRECTIONAL SWEEP)
 # ==========================================
-def analyze_spot_sweep(df):
+def analyze_liquidity_sweep(df):
     try:
         if len(df) < LOOKBACK_PERIOD + 5: return None
         curr = df.iloc[-2] # Last closed 4h candle
         prev_data = df.iloc[-(LOOKBACK_PERIOD + 2):-2]
         
-        swing_low = prev_data['low'].min()
+        # Ranges
+        range_low = prev_data['low'].min()
+        range_high = prev_data['high'].max()
         
-        # Criteria: Wick below 30-day low + Close above it + Green Candle
-        if (curr['low'] < swing_low) and (curr['close'] > swing_low) and (curr['close'] > curr['open']):
+        # --- BULLISH SWEEP (LONG) ---
+        if (curr['low'] < range_low) and (curr['close'] > range_low) and (curr['close'] > curr['open']):
             entry = curr['close']
-            sl = curr['low'] * 0.98 
+            sl = curr['low'] * 0.995 # Tightened SL for 4H
             tp = entry + ((entry - sl) * 2) 
-            return (entry, sl, tp, swing_low, curr['time'])
+            return ("LONG", entry, sl, tp, range_low, curr['time'])
+
+        # --- BEARISH SWEEP (SHORT) ---
+        if (curr['high'] > range_high) and (curr['close'] < range_high) and (curr['close'] < curr['open']):
+            entry = curr['close']
+            sl = curr['high'] * 1.005 # Tightened SL for 4H
+            tp = entry - ((sl - entry) * 2)
+            return ("SHORT", entry, sl, tp, range_high, curr['time'])
+
     except: return None
     return None
 
 # ==========================================
-# 5. SCANNER LOOP (With Heartbeat)
+# 4. SCANNER LOOP
 # ==========================================
 async def swing_scanner(application):
     pkt_tz = pytz.timezone('Asia/Karachi')
-    
-    # Send a one-time message to Telegram so you know the bot is alive
-    await application.bot.send_message(chat_id=CHAT_ID, text="🚀 **Binance 4H Sweep Bot Started!**\nScanning 100 pairs every 15 mins.")
+    await application.bot.send_message(chat_id=CHAT_ID, text="🚀 **Bi-Directional 4H Sweep Bot Active!**\nMonitoring Long & Short opportunities on 100 pairs.")
 
     while True:
         try:
             now_pkt = datetime.now(pkt_tz).strftime('%I:%M %p PKT')
-            print(f"[{now_pkt}] Starting scan...")
+            print(f"[{now_pkt}] Scanning for Long/Short sweeps...")
             
-            signals_found = 0
             for symbol in SYMBOLS_RAW:
                 try:
                     bars = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=200)
                     df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-                    signal = analyze_spot_sweep(df)
+                    signal = analyze_liquidity_sweep(df)
                     
                     if signal:
-                        entry, sl, tp, swing_low, sig_time = signal
-                        sig_id = f"{symbol}_{sig_time}"
+                        side, entry, sl, tp, level, sig_time = signal
+                        sig_id = f"{symbol}_{side}_{sig_time}"
                         
                         if sig_id not in last_signals:
+                            emoji = "🟢" if side == "LONG" else "🔴"
                             sig_dt = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d %I:%M %p')
-                            msg = (f"🟢 **LIQUIDITY SWEEP: {symbol}**\n\n"
+                            
+                            msg = (f"{emoji} **{side} LIQUIDITY SWEEP: {symbol}** {emoji}\n\n"
                                    f"Time: {sig_dt} PKT\n"
-                                   f"Low Swept: `${swing_low:.4f}`\n\n"
+                                   f"{'Support' if side == 'LONG' else 'Resistance'} Swept: `${level:.4f}`\n\n"
                                    f"Entry: `${entry:.4f}`\n"
-                                   f"SL: `${sl:.4f}`\n"
-                                   f"TP: `${tp:.4f}`")
+                                   f"Stop Loss: `${sl:.4f}`\n"
+                                   f"Take Profit: `${tp:.4f}`\n\n"
+                                   f"💡 *Strategy: 1x Leverage/Spot-Style Swing*")
+                            
                             await application.bot.send_message(chat_id=CHAT_ID, text=msg)
                             last_signals[sig_id] = True
-                            signals_found += 1
-                    await asyncio.sleep(0.1) # Rate limit protection
+                    await asyncio.sleep(0.1) # Protect API rate limit
                 except: continue
-            
-            print(f"Scan finished. Signals found: {signals_found}")
             
         except Exception as e:
             print(f"Loop Error: {e}")
             
-        await asyncio.sleep(900) # Wait 15 mins
+        await asyncio.sleep(900) # Scan every 15 minutes
 
 # ==========================================
-# 6. EXECUTION
+# 5. EXECUTION
 # ==========================================
 async def main():
     if not BOT_TOKEN or not CHAT_ID: return
     keep_alive()
     application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("status", lambda u, c: u.message.reply_text("✅ Bot is Online")))
     
     asyncio.create_task(swing_scanner(application))
     
