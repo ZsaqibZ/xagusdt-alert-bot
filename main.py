@@ -15,8 +15,7 @@ from threading import Thread
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-TIMEFRAME = '4h'            
-LOOKBACK_PERIOD = 180       
+TIMEFRAME = '1d'            # Daily Charts
 last_signals = {}           
 
 SYMBOLS_RAW = [
@@ -52,86 +51,106 @@ exchange = ccxt.binance({
 # ==========================================
 app = Flask('')
 @app.route('/')
-def home(): return "Bot Active"
+def home(): return "EMA 9/21 Daily Bot Active"
 def run_http(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 def keep_alive(): Thread(target=run_http, daemon=True).start()
 
 # ==========================================
-# 3. STRATEGY LOGIC (BI-DIRECTIONAL SWEEP)
+# 3. INDICATOR CALCULATIONS
 # ==========================================
-def analyze_liquidity_sweep(df):
+def calculate_indicators(df):
+    # EMAs
+    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+    
+    # ATR for Risk Management
+    df['tr0'] = abs(df['high'] - df['low'])
+    df['tr1'] = abs(df['high'] - df['close'].shift(1))
+    df['tr2'] = abs(df['low'] - df['close'].shift(1))
+    df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
+    df['atr'] = df['tr'].rolling(window=14).mean()
+    return df
+
+# ==========================================
+# 4. STRATEGY LOGIC (EMA CROSSOVER)
+# ==========================================
+def analyze_ema_cross(df):
     try:
-        if len(df) < LOOKBACK_PERIOD + 5: return None
-        curr = df.iloc[-2] # Last closed 4h candle
-        prev_data = df.iloc[-(LOOKBACK_PERIOD + 2):-2]
+        if len(df) < 30: return None
+        df = calculate_indicators(df)
         
-        # Ranges
-        range_low = prev_data['low'].min()
-        range_high = prev_data['high'].max()
+        curr = df.iloc[-2] # Last fully closed Daily candle
+        prev = df.iloc[-3] # The candle before it
         
-        # --- BULLISH SWEEP (LONG) ---
-        if (curr['low'] < range_low) and (curr['close'] > range_low) and (curr['close'] > curr['open']):
+        # --- BULLISH CROSS (EMA 9 crosses ABOVE 21) ---
+        bullish_cross = (prev['ema9'] <= prev['ema21']) and (curr['ema9'] > curr['ema21'])
+        
+        # --- BEARISH CROSS (EMA 9 crosses BELOW 21) ---
+        bearish_cross = (prev['ema9'] >= prev['ema21']) and (curr['ema9'] < curr['ema21'])
+        
+        if bullish_cross:
             entry = curr['close']
-            sl = curr['low'] * 0.995 # Tightened SL for 4H
-            tp = entry + ((entry - sl) * 2) 
-            return ("LONG", entry, sl, tp, range_low, curr['time'])
-
-        # --- BEARISH SWEEP (SHORT) ---
-        if (curr['high'] > range_high) and (curr['close'] < range_high) and (curr['close'] < curr['open']):
+            sl = entry - (2 * curr['atr']) # Stop Loss: 2x ATR below entry
+            tp = entry + (4 * curr['atr']) # Take Profit: 1:2 Reward Ratio
+            return ("LONG", entry, sl, tp, curr['time'])
+            
+        if bearish_cross:
             entry = curr['close']
-            sl = curr['high'] * 1.005 # Tightened SL for 4H
-            tp = entry - ((sl - entry) * 2)
-            return ("SHORT", entry, sl, tp, range_high, curr['time'])
-
+            sl = entry + (2 * curr['atr']) # Stop Loss: 2x ATR above entry
+            tp = entry - (4 * curr['atr']) # Take Profit: 1:2 Reward Ratio
+            return ("SHORT", entry, sl, tp, curr['time'])
+            
     except: return None
     return None
 
 # ==========================================
-# 4. SCANNER LOOP
+# 5. SCANNER LOOP
 # ==========================================
 async def swing_scanner(application):
     pkt_tz = pytz.timezone('Asia/Karachi')
-    await application.bot.send_message(chat_id=CHAT_ID, text="🚀 **Bi-Directional 4H Sweep Bot Active!**\nMonitoring Long & Short opportunities on 100 pairs.")
+    await application.bot.send_message(chat_id=CHAT_ID, text="🚀 **Daily EMA 9/21 Crossover Bot Started!**\nScanning 100 Binance pairs for trend changes.")
 
     while True:
         try:
             now_pkt = datetime.now(pkt_tz).strftime('%I:%M %p PKT')
-            print(f"[{now_pkt}] Scanning for Long/Short sweeps...")
+            print(f"[{now_pkt}] Starting Daily EMA Scan...")
             
             for symbol in SYMBOLS_RAW:
                 try:
-                    bars = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=200)
+                    # Fetch daily data
+                    bars = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
                     df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-                    signal = analyze_liquidity_sweep(df)
+                    signal = analyze_ema_cross(df)
                     
                     if signal:
-                        side, entry, sl, tp, level, sig_time = signal
+                        side, entry, sl, tp, sig_time = signal
                         sig_id = f"{symbol}_{side}_{sig_time}"
                         
                         if sig_id not in last_signals:
                             emoji = "🟢" if side == "LONG" else "🔴"
-                            sig_dt = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d %I:%M %p')
+                            sig_dt = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d')
                             
-                            msg = (f"{emoji} **{side} LIQUIDITY SWEEP: {symbol}** {emoji}\n\n"
-                                   f"Time: {sig_dt} PKT\n"
-                                   f"{'Support' if side == 'LONG' else 'Resistance'} Swept: `${level:.4f}`\n\n"
+                            msg = (f"{emoji} **EMA CROSSOVER: {symbol}** {emoji}\n\n"
+                                   f"Side: **{side}**\n"
+                                   f"Date: {sig_dt}\n\n"
                                    f"Entry: `${entry:.4f}`\n"
                                    f"Stop Loss: `${sl:.4f}`\n"
                                    f"Take Profit: `${tp:.4f}`\n\n"
-                                   f"💡 *Strategy: 1x Leverage/Spot-Style Swing*")
+                                   f"📊 *9 EMA has crossed {'above' if side == 'LONG' else 'below'} 21 EMA.*")
                             
-                            await application.bot.send_message(chat_id=CHAT_ID, text=msg)
+                            await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
                             last_signals[sig_id] = True
-                    await asyncio.sleep(0.1) # Protect API rate limit
+                    await asyncio.sleep(0.1)
                 except: continue
             
         except Exception as e:
             print(f"Loop Error: {e}")
             
-        await asyncio.sleep(900) # Scan every 15 minutes
+        # Daily candles close once every 24 hours. Scanning every 1 hour is enough.
+        await asyncio.sleep(3600) 
 
 # ==========================================
-# 5. EXECUTION
+# 6. EXECUTION
 # ==========================================
 async def main():
     if not BOT_TOKEN or not CHAT_ID: return
