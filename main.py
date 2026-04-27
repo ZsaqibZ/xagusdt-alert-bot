@@ -15,12 +15,12 @@ from threading import Thread
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Active Timeframes and their respective ATR Multipliers for SL/TP
+# Dynamic Lookbacks translated directly from your Pine Script
 TIMEFRAME_SETTINGS = {
-    '1d':  {'sl': 2.0, 'tp': 4.0},
-    '12h': {'sl': 1.8, 'tp': 3.6},
-    '8h':  {'sl': 1.7, 'tp': 3.4},
-    '4h':  {'sl': 1.5, 'tp': 3.0}
+    '15m': {'lookback': 96, 'sl_mult': 1.2, 'tp_mult': 2.4},
+    '1h':  {'lookback': 100, 'sl_mult': 1.5, 'tp_mult': 3.0}, # Fallback 100
+    '4h':  {'lookback': 60,  'sl_mult': 1.8, 'tp_mult': 3.6},
+    '1d':  {'lookback': 20,  'sl_mult': 2.0, 'tp_mult': 4.0}
 }
 
 last_signals = {}           
@@ -58,98 +58,102 @@ exchange = ccxt.binance({
 # ==========================================
 app = Flask('')
 @app.route('/')
-def home(): return "Multi-TF EMA Bot Active"
+def home(): return "Dynamic Liquidity Bot Active"
 def run_http(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 def keep_alive(): Thread(target=run_http, daemon=True).start()
 
 # ==========================================
-# 3. INDICATOR CALCULATIONS
+# 3. STRATEGY LOGIC (DYNAMIC RECLAIM SWEEP)
 # ==========================================
-def calculate_indicators(df):
-    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-    
-    # ATR 14
-    df['tr0'] = abs(df['high'] - df['low'])
-    df['tr1'] = abs(df['high'] - df['close'].shift(1))
-    df['tr2'] = abs(df['low'] - df['close'].shift(1))
-    df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
-    df['atr'] = df['tr'].rolling(window=14).mean()
-    return df
-
-# ==========================================
-# 4. STRATEGY LOGIC (MULTI-TIMEFRAME)
-# ==========================================
-def analyze_ema_cross(df, tf):
+def analyze_dynamic_sweep(df, tf):
     try:
-        if len(df) < 30: return None
-        df = calculate_indicators(df)
+        lookback = TIMEFRAME_SETTINGS[tf]['lookback']
+        
+        # Need enough data for the lookback + current candles
+        if len(df) < lookback + 5: return None
         
         curr = df.iloc[-2] # Last closed candle
-        prev = df.iloc[-3] # Candle before it
+        prev = df.iloc[-3] # The "trap" candle before it
         
-        # Cross detections
-        bullish_cross = (prev['ema9'] <= prev['ema21']) and (curr['ema9'] > curr['ema21'])
-        bearish_cross = (prev['ema9'] >= prev['ema21']) and (curr['ema9'] < curr['ema21'])
+        # Slicing the dataframe to get the exact rolling window BEFORE the 'prev' candle
+        # This accurately mirrors `ta.lowest(low, lookback)[1]` in Pine Script
+        window_data = df.iloc[-(lookback + 3):-3]
         
-        # Get multipliers for this specific timeframe
-        sl_mult = TIMEFRAME_SETTINGS[tf]['sl']
-        tp_mult = TIMEFRAME_SETTINGS[tf]['tp']
+        range_low = window_data['low'].min()
+        range_high = window_data['high'].max()
         
-        if bullish_cross:
+        # ATR for Risk Management
+        df['tr0'] = abs(df['high'] - df['low'])
+        df['tr1'] = abs(df['high'] - df['close'].shift(1))
+        df['tr2'] = abs(df['low'] - df['close'].shift(1))
+        df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
+        curr_atr = df['tr'].rolling(window=14).mean().iloc[-2]
+
+        sl_mult = TIMEFRAME_SETTINGS[tf]['sl_mult']
+        tp_mult = TIMEFRAME_SETTINGS[tf]['tp_mult']
+
+        # --- Reclaim Logic ---
+        # Bullish: Prev candle closed below Support, Curr candle closed green above Support
+        bullish_reclaim = (prev['close'] < range_low) and (curr['close'] > range_low) and (curr['close'] > curr['open'])
+        
+        # Bearish: Prev candle closed above Resistance, Curr candle closed red below Resistance
+        bearish_reclaim = (prev['close'] > range_high) and (curr['close'] < range_high) and (curr['close'] < curr['open'])
+        
+        if bullish_reclaim:
             entry = curr['close']
-            sl = entry - (sl_mult * curr['atr'])
-            tp = entry + (tp_mult * curr['atr'])
-            return ("LONG", entry, sl, tp, curr['time'])
+            sl = entry - (curr_atr * sl_mult)
+            tp = entry + (curr_atr * tp_mult)
+            return ("LONG", entry, sl, tp, range_low, curr['time'])
             
-        if bearish_cross:
+        if bearish_reclaim:
             entry = curr['close']
-            sl = entry + (sl_mult * curr['atr'])
-            tp = entry - (tp_mult * curr['atr'])
-            return ("SHORT", entry, sl, tp, curr['time'])
+            sl = entry + (curr_atr * sl_mult)
+            tp = entry - (curr_atr * tp_mult)
+            return ("SHORT", entry, sl, tp, range_high, curr['time'])
             
     except: return None
     return None
 
 # ==========================================
-# 5. SCANNER LOOP
+# 4. SCANNER LOOP
 # ==========================================
 async def swing_scanner(application):
     pkt_tz = pytz.timezone('Asia/Karachi')
     await application.bot.send_message(
         chat_id=CHAT_ID, 
-        text="🚀 **Multi-TF EMA 9/21 Bot Started!**\nScanning 4h, 8h, 12h, and 1d timeframes."
+        text="🚀 **Dynamic Liquidity Bot Started!**\nScanning 15m, 1h, 4h, and 1d with Auto-Lookbacks."
     )
 
     while True:
         try:
             for tf in TIMEFRAME_SETTINGS.keys():
                 now_pkt = datetime.now(pkt_tz).strftime('%I:%M %p PKT')
-                print(f"[{now_pkt}] Starting scan for Timeframe: {tf}")
+                print(f"[{now_pkt}] Scanning {tf} (Lookback: {TIMEFRAME_SETTINGS[tf]['lookback']})...")
                 
                 for symbol in SYMBOLS_RAW:
                     try:
-                        # Fetch enough data for the indicators
-                        bars = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
+                        # Fetch enough bars to cover the max lookback safely
+                        limit = TIMEFRAME_SETTINGS[tf]['lookback'] + 20
+                        bars = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
                         df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-                        signal = analyze_ema_cross(df, tf)
+                        signal = analyze_dynamic_sweep(df, tf)
                         
                         if signal:
-                            side, entry, sl, tp, sig_time = signal
-                            # Unique ID includes timeframe to allow signals on same coin in different TFs
+                            side, entry, sl, tp, level, sig_time = signal
                             sig_id = f"{symbol}_{side}_{tf}_{sig_time}"
                             
                             if sig_id not in last_signals:
                                 emoji = "🟢" if side == "LONG" else "🔴"
                                 sig_dt = datetime.fromtimestamp(sig_time / 1000, pkt_tz).strftime('%Y-%m-%d %I:%M %p')
                                 
-                                msg = (f"{emoji} **EMA CROSSOVER ({tf}): {symbol}** {emoji}\n\n"
+                                msg = (f"{emoji} **LIQUIDITY RECLAIM ({tf}): {symbol}** {emoji}\n\n"
                                        f"Side: **{side}**\n"
-                                       f"Time: {sig_dt} PKT\n\n"
+                                       f"Time: {sig_dt} PKT\n"
+                                       f"Level Swept: `${level:.4f}`\n\n"
                                        f"Entry: `${entry:.4f}`\n"
                                        f"Stop Loss: `${sl:.4f}`\n"
                                        f"Take Profit: `${tp:.4f}`\n\n"
-                                       f"📊 *Strategy: 9 EMA cross on {tf} chart.*")
+                                       f"📊 *Auto-Lookback Used: {TIMEFRAME_SETTINGS[tf]['lookback']} candles*")
                                 
                                 await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
                                 last_signals[sig_id] = True
@@ -157,15 +161,15 @@ async def swing_scanner(application):
                         await asyncio.sleep(0.1) # Protect Binance Rate Limits
                     except: continue
                 
-            print("Full Multi-TF scan finished. Sleeping for 15 minutes...")
-            await asyncio.sleep(900) # Scan all TFs every 15 minutes
+            print("Full Multi-TF scan finished. Sleeping for 10 minutes...")
+            await asyncio.sleep(600)
 
         except Exception as e:
             print(f"Global Loop Error: {e}")
             await asyncio.sleep(60)
 
 # ==========================================
-# 6. EXECUTION
+# 5. EXECUTION
 # ==========================================
 async def main():
     if not BOT_TOKEN or not CHAT_ID: return
