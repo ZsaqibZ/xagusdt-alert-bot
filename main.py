@@ -48,7 +48,7 @@ SYMBOLS_RAW = [
     'NOT/USDT', 'TURBO/USDT', 'TAO/USDT', 'W/USDT', 'TNSR/USDT'
 ]
 
-exchange = ccxt.binance({
+exchange = ccxt.mexc({
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
 })
