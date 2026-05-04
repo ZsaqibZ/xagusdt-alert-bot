@@ -2,6 +2,7 @@ import os
 import ccxt.async_support as ccxt
 import pandas as pd
 import asyncio
+import numpy as np
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -15,14 +16,17 @@ from collections import defaultdict
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Timeframes to scan (15m removed)
+# Only 1h, 4h, 1d (15m removed)
 TIMEFRAME_SETTINGS = {
-    '1h':  {'lookback': 48,  'sl_mult': 1.5, 'tp_mult': 2.5, 'ema_period': 200},
-    '4h':  {'lookback': 30,  'sl_mult': 1.5, 'tp_mult': 2.5, 'ema_period': 200},
-    '1d':  {'lookback': 20,  'sl_mult': 1.5, 'tp_mult': 2.5, 'ema_period': 200}
+    '1h':  {'sl_mult': 1.2, 'tp_mult': 2.2, 'ema_period': 200, 'min_atr_pct': 0.0015},
+    '4h':  {'sl_mult': 1.3, 'tp_mult': 2.4, 'ema_period': 200, 'min_atr_pct': 0.0020},
+    '1d':  {'sl_mult': 1.5, 'tp_mult': 2.6, 'ema_period': 200, 'min_atr_pct': 0.0025}
 }
 
-last_signals = {}                     # avoid duplicate signals
+# Dynamic lookback: will be calculated per symbol based on ATR
+BASE_LOOKBACK = {'1h': 48, '4h': 30, '1d': 20}
+
+last_signals = {}
 signal_stats = {'LONG': 0, 'SHORT': 0, 'by_tf': defaultdict(int)}
 last_scan_time = None
 
@@ -49,18 +53,14 @@ SYMBOLS_RAW = [
     'NOT/USDT', 'TURBO/USDT', 'TAO/USDT', 'W/USDT', 'TNSR/USDT'
 ]
 
-# Global exchange instance
-exchange = ccxt.mexc({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
+exchange = None
 
 # ==========================================
-# 2. RENDER KEEP-ALIVE
+# 2. KEEP-ALIVE SERVER
 # ==========================================
 app = Flask('')
 @app.route('/')
-def home(): return "Dynamic Liquidity Bot Active (Improved)"
+def home(): return "Liquidity Footprint Bot Active"
 
 def run_http():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
@@ -69,263 +69,270 @@ def keep_alive():
     Thread(target=run_http, daemon=True).start()
 
 # ==========================================
-# 3. EXCHANGE CONNECTION (with auto-reconnect)
+# 3. EXCHANGE HANDLER
 # ==========================================
 async def get_exchange():
     global exchange
     if exchange is None:
-        exchange = ccxt.mexc({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
-        })
+        exchange = ccxt.mexc({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
         await exchange.load_markets()
-        print("Exchange initialized")
     return exchange
 
 async def reconnect_exchange():
     global exchange
     if exchange:
         await exchange.close()
-    exchange = ccxt.mexc({
-        'enableRateLimit': True,
-        'options': {'defaultType': 'spot'}
-    })
+    exchange = ccxt.mexc({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
     await exchange.load_markets()
-    print("Exchange reconnected")
 
 # ==========================================
-# 4. IMPROVED STRATEGY LOGIC
+# 4. VOLUME FOOTPRINT & WICK DETECTION
 # ==========================================
-def calculate_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def calculate_delta(df):
+    """Approximate buying/selling pressure: (close - open) * volume, normalised"""
+    df['delta'] = (df['close'] - df['open']) * df['volume']
+    return df
 
-def analyze_dynamic_sweep(df, tf):
+def wick_size(df, level, side='support'):
+    """Calculate wick relative to level on previous candle"""
+    if side == 'support':
+        wick_below = level - df['low']
+        return wick_below / (df['high'] - df['low'] + 1e-8)
+    else:
+        wick_above = df['high'] - level
+        return wick_above / (df['high'] - df['low'] + 1e-8)
+
+# ==========================================
+# 5. IMPROVED STRATEGY WITH STRENGTH SCORE
+# ==========================================
+def calculate_dynamic_lookback(df, tf):
+    """Adjust lookback based on market volatility (ATR)"""
+    atr = df['tr'].rolling(14).mean().iloc[-1]
+    price = df['close'].iloc[-1]
+    atr_pct = atr / price
+    base = BASE_LOOKBACK[tf]
+    if atr_pct > 0.03:  # high volatility – shorter lookback
+        return max(10, base // 2)
+    elif atr_pct < 0.01: # low volatility – longer lookback
+        return base * 2
+    return base
+
+def analyze_footprint_sweep(df, tf):
     """
-    Enhanced logic:
-    - Detects liquidity sweep + reclaim
-    - Requires trend filter (price > 200 EMA for long, < for short)
-    - Volume confirmation (reclaim candle volume >= 1.2 * avg volume last 20)
-    - Adaptive ATR stop-loss
+    Returns (signal_type, entry, sl, tp, level, strength_score) or None
+    Strength score 0-100, only send if >= 70
     """
     try:
         settings = TIMEFRAME_SETTINGS[tf]
-        lookback = settings['lookback']
-        ema_period = settings['ema_period']
+        min_atr_pct = settings['min_atr_pct']
         sl_mult = settings['sl_mult']
         tp_mult = settings['tp_mult']
+        ema_period = settings['ema_period']
 
-        if len(df) < lookback + 10:
+        if len(df) < 60:
             return None
 
-        # Last two closed candles
-        curr = df.iloc[-2]   # most recent closed candle
-        prev = df.iloc[-3]   # the "sweep" candle
-
-        # Calculate range (liquidity zone)
-        window = df.iloc[-(lookback + 3):-3]
-        range_low = window['low'].min()
-        range_high = window['high'].max()
-
-        # ATR (14-period)
+        # Calculate indicators
         df['tr0'] = abs(df['high'] - df['low'])
         df['tr1'] = abs(df['high'] - df['close'].shift(1))
         df['tr2'] = abs(df['low'] - df['close'].shift(1))
         df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
-        atr = df['tr'].rolling(window=14).mean().iloc[-2]
+        atr = df['tr'].rolling(14).mean()
+        current_atr = atr.iloc[-2]
+        price = df['close'].iloc[-2]
+        if current_atr / price < min_atr_pct:
+            return None  # too choppy
 
-        if atr == 0 or pd.isna(atr):
-            return None
+        # Dynamic lookback
+        lookback = calculate_dynamic_lookback(df, tf)
+        
+        # Last two closed candles
+        curr = df.iloc[-2]
+        prev = df.iloc[-3]
 
-        # ---- Volume confirmation ----
+        # Range for liquidity
+        window = df.iloc[-(lookback+3):-3]
+        range_low = window['low'].min()
+        range_high = window['high'].max()
+
+        # Volume footprint: delta and volume spike
+        df = calculate_delta(df)
         avg_volume = df['volume'].tail(20).mean()
-        volume_ok = curr['volume'] >= avg_volume * 1.2
-
-        # ---- Trend filter (EMA) ----
-        df['ema'] = calculate_ema(df['close'], ema_period)
+        avg_delta = df['delta'].tail(20).mean()
+        
+        volume_spike = curr['volume'] > avg_volume * 1.5
+        delta_strength = abs(curr['delta']) > abs(avg_delta) * 2.0
+        
+        # Wick confirmation
+        wick_long = False
+        # Trend filter
+        df['ema'] = df['close'].ewm(span=ema_period, adjust=False).mean()
         current_ema = df['ema'].iloc[-2]
-        if pd.isna(current_ema):
-            return None
+        above_ema = curr['close'] > current_ema
+        below_ema = curr['close'] < current_ema
 
-        # ---- Reclaim conditions ----
-        # Bullish: prev closed below support, curr closed green above support, trend bullish (price > EMA)
-        bullish_reclaim = (prev['close'] < range_low) and (curr['close'] > range_low) and \
-                          (curr['close'] > curr['open']) and (curr['close'] > current_ema) and volume_ok
-
-        # Bearish: prev closed above resistance, curr closed red below resistance, trend bearish (price < EMA)
-        bearish_reclaim = (prev['close'] > range_high) and (curr['close'] < range_high) and \
-                          (curr['close'] < curr['open']) and (curr['close'] < current_ema) and volume_ok
-
-        if bullish_reclaim:
-            entry = curr['close']
-            sl = entry - (atr * sl_mult)
-            tp = entry + (atr * tp_mult)
-            # Avoid tiny moves: require at least 0.3% potential profit
-            if (tp - entry) / entry < 0.003:
+        # ---------- BULLISH RECLAIM ----------
+        if (prev['close'] < range_low) and (curr['close'] > range_low) and (curr['close'] > curr['open']) and above_ema:
+            # Reclaim margin: close must be > range_low + 0.1% 
+            margin = range_low * 0.001
+            if curr['close'] < range_low + margin:
                 return None
-            return ("LONG", entry, sl, tp, range_low, curr.name)
-            
-        if bearish_reclaim:
-            entry = curr['close']
-            sl = entry + (atr * sl_mult)
-            tp = entry - (atr * tp_mult)
-            if (entry - tp) / entry < 0.003:
+            # Wick on prev candle?
+            wick_below = (range_low - prev['low']) / (prev['high'] - prev['low'] + 1e-8)
+            if wick_below > 0.3:  # at least 30% wick below support
+                wick_long = True
+            # Strength score
+            score = 0
+            if volume_spike: score += 30
+            if delta_strength: score += 30
+            if wick_long: score += 20
+            if above_ema: score += 10
+            if curr['close'] > range_low * 1.002: score += 10  # reclaimed well
+            if score < 70:
                 return None
-            return ("SHORT", entry, sl, tp, range_high, curr.name)
+            entry = curr['close']
+            # Place SL below the sweep wick or ATR-based, whichever is tighter
+            sl_candidate = min(entry - current_atr * sl_mult, range_low - current_atr * 0.5)
+            sl = max(sl_candidate, entry * 0.98)  # max 2% SL
+            tp = entry + current_atr * tp_mult
+            return ("LONG", entry, sl, tp, range_low, curr.name, score)
+
+        # ---------- BEARISH RECLAIM ----------
+        if (prev['close'] > range_high) and (curr['close'] < range_high) and (curr['close'] < curr['open']) and below_ema:
+            margin = range_high * 0.001
+            if curr['close'] > range_high - margin:
+                return None
+            wick_above = (prev['high'] - range_high) / (prev['high'] - prev['low'] + 1e-8)
+            if wick_above > 0.3:
+                wick_long = True
+            score = 0
+            if volume_spike: score += 30
+            if delta_strength: score += 30
+            if wick_long: score += 20
+            if below_ema: score += 10
+            if curr['close'] < range_high * 0.998: score += 10
+            if score < 70:
+                return None
+            entry = curr['close']
+            sl_candidate = max(entry + current_atr * sl_mult, range_high + current_atr * 0.5)
+            sl = min(sl_candidate, entry * 1.02)
+            tp = entry - current_atr * tp_mult
+            return ("SHORT", entry, sl, tp, range_high, curr.name, score)
 
     except Exception as e:
-        # silently skip individual errors
         pass
     return None
 
 # ==========================================
-# 5. SCANNER LOOP (with improved logging)
+# 6. SCANNER LOOP
 # ==========================================
 async def swing_scanner(application):
     global last_scan_time
-    # send startup message
     await application.bot.send_message(
         chat_id=CHAT_ID,
-        text="🚀 **Improved Dynamic Liquidity Bot Started!**\n"
-             "Scanning 1h, 4h, 1d with trend & volume filters.\n"
-             "Use /help for available commands."
+        text="🔍 **Liquidity Footprint Bot Active**\nScanning 1h, 4h, 1d with volume footprint & strength scoring.\nMinimum signal strength: 70/100"
     )
-
     while True:
         try:
             exch = await get_exchange()
             now_utc = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-            print(f"[{now_utc}] Starting scan cycle...")
-
-            for tf in TIMEFRAME_SETTINGS.keys():
+            print(f"[{now_utc}] Scan cycle start")
+            for tf in TIMEFRAME_SETTINGS:
                 print(f"  Scanning {tf}...")
                 for symbol in SYMBOLS_RAW:
                     try:
-                        limit = TIMEFRAME_SETTINGS[tf]['lookback'] + 30
+                        limit = BASE_LOOKBACK[tf] + 50
                         bars = await exch.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
                         if len(bars) < limit:
                             continue
                         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                         df.set_index('timestamp', inplace=True)
-
-                        signal = analyze_dynamic_sweep(df, tf)
-                        if signal:
-                            side, entry, sl, tp, level, sig_time = signal
+                        res = analyze_footprint_sweep(df, tf)
+                        if res:
+                            side, entry, sl, tp, level, sig_time, score = res
                             sig_id = f"{symbol}_{side}_{tf}_{sig_time}"
                             if sig_id not in last_signals:
-                                # update stats
+                                last_signals[sig_id] = True
                                 signal_stats[side] += 1
                                 signal_stats['by_tf'][tf] += 1
-                                last_signals[sig_id] = True
-
-                                # format message with UTC time
-                                sig_dt = sig_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(sig_time, 'strftime') else str(sig_time)
+                                sig_dt = sig_time.strftime('%Y-%m-%d %H:%M:%S')
                                 emoji = "🟢" if side == "LONG" else "🔴"
                                 msg = (
-                                    f"{emoji} **LIQUIDITY RECLAIM ({tf})** {emoji}\n"
+                                    f"{emoji} **STRONG LIQUIDITY RECLAIM ({tf})** {emoji}\n"
                                     f"**Symbol:** `{symbol}`\n"
                                     f"**Side:** {side}\n"
                                     f"**Time (UTC):** {sig_dt}\n"
-                                    f"**Swept Level:** `${level:.6f}`\n\n"
+                                    f"**Swept Level:** `${level:.6f}`\n"
+                                    f"**Strength Score:** {score}/100\n\n"
                                     f"**Entry:** `${entry:.6f}`\n"
                                     f"**Stop Loss:** `${sl:.6f}`\n"
                                     f"**Take Profit:** `${tp:.6f}`\n\n"
-                                    f"📊 *Lookback: {TIMEFRAME_SETTINGS[tf]['lookback']} | ATR multiple SL:{TIMEFRAME_SETTINGS[tf]['sl_mult']} TP:{TIMEFRAME_SETTINGS[tf]['tp_mult']}*"
+                                    f"📌 *Volatility adjusted lookback | Volume footprint confirmed*"
                                 )
                                 await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-                                print(f"Signal sent: {symbol} {side} on {tf}")
-                        await asyncio.sleep(0.1)  # gentle rate limit
-                    except Exception as e:
-                        # per-symbol error: skip silently to keep scanning
+                                print(f"Signal: {symbol} {side} on {tf} (score {score})")
+                        await asyncio.sleep(0.1)
+                    except Exception:
                         continue
-
             last_scan_time = datetime.utcnow()
-            print(f"Cycle finished. Sleeping 10 minutes...")
+            print("Cycle done, sleeping 10 minutes")
             await asyncio.sleep(600)
-
         except Exception as e:
-            print(f"Global loop error: {e}")
+            print(f"Loop error: {e}")
             await reconnect_exchange()
             await asyncio.sleep(60)
 
 # ==========================================
-# 6. TELEGRAM COMMANDS
+# 7. TELEGRAM COMMANDS
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *Dynamic Liquidity Bot*\n"
-        "I scan 1h, 4h, 1d for liquidity sweeps + reclaims.\n"
-        "Use /help to see available commands.",
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text("Footprint Liquidity Bot – sends high‑strength signals only.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "📖 *Available commands:*\n"
-        "/status – Show bot status & last scan time\n"
-        "/stats – Signal statistics (LONG/SHORT per timeframe)\n"
-        "/symbols – List all tracked symbols (count)\n"
-        "/start – Welcome message\n"
-        "/help – This help"
-    )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    text = "/status – bot health\n/stats – signal counts\n/symbols – tracked symbols\n/strength – explanation of scoring"
+    await update.message.reply_text(text)
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_scan_time
-    if last_scan_time:
-        last_scan = last_scan_time.strftime('%Y-%m-%d %H:%M:%S UTC')
-    else:
-        last_scan = "Not yet scanned"
-    status_msg = (
-        f"✅ *Bot is running*\n"
-        f"📊 Scanning timeframes: 1h, 4h, 1d\n"
-        f"🕒 Last full scan: {last_scan}\n"
-        f"🔍 Symbols tracked: {len(SYMBOLS_RAW)}\n"
-        f"📈 Unique signals sent: {len(last_signals)}"
-    )
-    await update.message.reply_text(status_msg, parse_mode='Markdown')
+    await update.message.reply_text(f"Active. Last scan: {last_scan_time or 'never'}")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats_msg = (
-        f"📊 *Signal Statistics*\n"
-        f"LONG signals: {signal_stats['LONG']}\n"
-        f"SHORT signals: {signal_stats['SHORT']}\n"
-        f"\n*Per timeframe:*\n"
-    )
-    for tf in TIMEFRAME_SETTINGS:
-        stats_msg += f"{tf}: {signal_stats['by_tf'][tf]}\n"
-    await update.message.reply_text(stats_msg, parse_mode='Markdown')
+    msg = f"LONG: {signal_stats['LONG']}\nSHORT: {signal_stats['SHORT']}\nBy TF: {dict(signal_stats['by_tf'])}"
+    await update.message.reply_text(msg)
 
 async def symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🔍 Tracking {len(SYMBOLS_RAW)} symbols:\n" + ", ".join(SYMBOLS_RAW[:20]) + ("..." if len(SYMBOLS_RAW) > 20 else ""))
+    await update.message.reply_text(f"Tracking {len(SYMBOLS_RAW)} symbols")
+
+async def strength(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = ("Signal strength (0-100) requires:\n"
+            "• Volume spike (30 pts)\n"
+            "• Delta surge (30 pts)\n"
+            "• Long wick on sweep (20 pts)\n"
+            "• Trend alignment (10 pts)\n"
+            "• Clean reclaim (10 pts)\n"
+            "Minimum 70 to send.")
+    await update.message.reply_text(text)
 
 # ==========================================
-# 7. MAIN EXECUTION
+# 8. MAIN
 # ==========================================
 async def main():
     if not BOT_TOKEN or not CHAT_ID:
-        print("Missing BOT_TOKEN or CHAT_ID environment variables.")
+        print("Missing env variables")
         return
-
-    keep_alive()  # for Render
-
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Register commands
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("symbols", symbols))
-
-    # Start background scanner
-    asyncio.create_task(swing_scanner(application))
-
-    # Start bot
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
-    await asyncio.Event().wait()  # run forever
+    keep_alive()
+    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(CommandHandler("help", help_command))
+    app_bot.add_handler(CommandHandler("status", status))
+    app_bot.add_handler(CommandHandler("stats", stats))
+    app_bot.add_handler(CommandHandler("symbols", symbols))
+    app_bot.add_handler(CommandHandler("strength", strength))
+    asyncio.create_task(swing_scanner(app_bot))
+    await app_bot.initialize()
+    await app_bot.start()
+    await app_bot.updater.start_polling(drop_pending_updates=True)
+    await asyncio.Event().wait()
 
 if __name__ == '__main__':
     asyncio.run(main())
