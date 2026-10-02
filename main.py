@@ -56,7 +56,7 @@ async def get_market_data(exch, symbol):
         # 3. Order Book Walls (TIT 5)
         ob = await exch.fetch_order_book(symbol, limit=20)
         top_bid_vol = sum([b[1] for b in ob['bids']])
-        top_ask_vol = sum([a[1] for a in ob['asks'])
+        top_ask_vol = sum([a[1] for a in ob['asks']])
 
         return {
             'price': df['c'].iloc[-1],
@@ -151,6 +151,110 @@ async def monitor_loop(application):
             await asyncio.sleep(30)
 
 # ==========================================
+# 3B. EMA SIGNAL SYSTEM (WEEKLY / MONTHLY)
+# ==========================================
+# Settings (periods are counted in 1h candles, so keep EMA_TIMEFRAME at '1h')
+EMA_TIMEFRAME      = '1h'
+EMA_WEEKLY_PERIOD  = 24 * 7     # 168 candles = 1 week
+EMA_MONTHLY_PERIOD = 24 * 30    # 720 candles = 30 days
+EMA_WARMUP_MULT    = 3          # fetch period x 3 candles so the EMA settles
+EMA_PAGE_LIMIT     = 500        # candles per exchange request
+EMA_SCAN_DELAY     = 5          # seconds to wait after a candle closes
+
+EMA_SYSTEMS = [
+    {'name': 'Weekly',  'period': EMA_WEEKLY_PERIOD,  'label': 'Medium Sensitivity Signal'},
+    {'name': 'Monthly', 'period': EMA_MONTHLY_PERIOD, 'label': 'High Sensitivity Signal'},
+]
+
+def init_ema_db():
+    conn = sqlite3.connect('alerts.db')
+    conn.execute("CREATE TABLE IF NOT EXISTS ema_watchlist (symbol TEXT PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+
+init_ema_db()
+
+def fmt_price(p):
+    return f"{p:,.2f}" if p >= 1 else f"{p:.8f}".rstrip('0')
+
+async def fetch_ema_candles(exch, symbol, n_candles):
+    """Paginated 1h OHLCV fetch (exchanges cap candles per request). Closed candles only."""
+    tf_ms  = exch.parse_timeframe(EMA_TIMEFRAME) * 1000
+    now_ms = exch.milliseconds()
+    since  = now_ms - n_candles * tf_ms
+    candles = {}
+
+    while since < now_ms:
+        batch = await exch.fetch_ohlcv(symbol, EMA_TIMEFRAME, since=since, limit=EMA_PAGE_LIMIT)
+        if not batch:
+            break
+        for c in batch:
+            candles[c[0]] = c
+        next_since = batch[-1][0] + tf_ms
+        if next_since <= since:
+            break
+        since = next_since
+
+    # Drop the candle that is still forming
+    return [c for t, c in sorted(candles.items()) if t + tf_ms <= now_ms]
+
+def detect_ema_cross(closes, period):
+    """Price close crossing the EMA on the last closed candle -> (side, close, ema) or None"""
+    ema = closes.ewm(span=period, adjust=False).mean()
+    prev_c, last_c = closes.iloc[-2], closes.iloc[-1]
+    prev_e, last_e = ema.iloc[-2], ema.iloc[-1]
+
+    if prev_c <= prev_e and last_c > last_e:
+        return 'BUY', last_c, last_e
+    if prev_c >= prev_e and last_c < last_e:
+        return 'SELL', last_c, last_e
+    return None
+
+def format_ema_signal(symbol, system, side, close, ema):
+    icon = "🟢" if side == 'BUY' else "🔴"
+    verb = "above" if side == 'BUY' else "below"
+    return (
+        f"{icon} {side} - {symbol}\n"
+        f"{system['label']}\n\n"
+        f"Price closed {verb} the {system['name']} EMA ({system['period']}) on {EMA_TIMEFRAME}\n"
+        f"Close: ${fmt_price(close)} | EMA: ${fmt_price(ema)}"
+    )
+
+async def scan_ema_signals(exch, application):
+    conn = sqlite3.connect('alerts.db')
+    symbols = [r[0] for r in conn.execute("SELECT symbol FROM ema_watchlist").fetchall()]
+    conn.close()
+
+    n_candles = max(s['period'] for s in EMA_SYSTEMS) * EMA_WARMUP_MULT
+    for symbol in symbols:
+        try:
+            candles = await fetch_ema_candles(exch, symbol, n_candles)
+            df = pd.DataFrame(candles, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+
+            for s in EMA_SYSTEMS:
+                if len(df) < s['period'] + 2:
+                    continue  # not enough history (new listing)
+                signal = detect_ema_cross(df['c'], s['period'])
+                if signal:
+                    side, close, ema = signal
+                    await application.bot.send_message(CHAT_ID, format_ema_signal(symbol, s, side, close, ema))
+        except Exception as e:
+            print(f"EMA Scan Error for {symbol}: {e}")
+        await asyncio.sleep(0.1)
+
+async def ema_signal_loop(application):
+    exch = ccxt.mexc({'enableRateLimit': True})
+    tf_sec = exch.parse_timeframe(EMA_TIMEFRAME)
+    while True:
+        # Signals only change when a candle closes, so wake up right after each close
+        now_sec = exch.milliseconds() / 1000
+        await asyncio.sleep(tf_sec - (now_sec % tf_sec) + EMA_SCAN_DELAY)
+        try:
+            await scan_ema_signals(exch, application)
+        except Exception as e:
+            print(f"EMA Loop Error: {e}")
+
+# ==========================================
 # 4. BOT COMMANDS (THE NEW GUI)
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,6 +324,57 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✅ Alert deleted.")
 
 # ==========================================
+# 4B. EMA SIGNAL COMMANDS
+# ==========================================
+async def add_ema_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    exch = ccxt.mexc()
+    try:
+        symbol = context.args[0].upper()
+        await exch.fetch_ticker(symbol)  # validates the symbol
+
+        conn = sqlite3.connect('alerts.db')
+        conn.execute("INSERT OR IGNORE INTO ema_watchlist (symbol) VALUES (?)", (symbol,))
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(
+            f"✅ EMA signals enabled for {symbol}\n"
+            f"• Weekly EMA ({EMA_WEEKLY_PERIOD}) - Medium Sensitivity\n"
+            f"• Monthly EMA ({EMA_MONTHLY_PERIOD}) - High Sensitivity\n"
+            f"Checked at every {EMA_TIMEFRAME} candle close."
+        )
+    except Exception:
+        await update.message.reply_text("❌ Use: `/ema BTC/USDT`", parse_mode='Markdown')
+    finally:
+        await exch.close()
+
+async def remove_ema_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        symbol = context.args[0].upper()
+        conn = sqlite3.connect('alerts.db')
+        removed = conn.execute("DELETE FROM ema_watchlist WHERE symbol=?", (symbol,)).rowcount
+        conn.commit()
+        conn.close()
+
+        if removed:
+            await update.message.reply_text(f"✅ EMA signals disabled for {symbol}")
+        else:
+            await update.message.reply_text(f"{symbol} is not on the EMA watchlist.")
+    except IndexError:
+        await update.message.reply_text("❌ Use: `/emaoff BTC/USDT`", parse_mode='Markdown')
+
+async def list_ema_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect('alerts.db')
+    symbols = [r[0] for r in conn.execute("SELECT symbol FROM ema_watchlist ORDER BY symbol").fetchall()]
+    conn.close()
+
+    if not symbols:
+        await update.message.reply_text("No symbols on the EMA watchlist.\nAdd one: /ema BTC/USDT")
+        return
+
+    await update.message.reply_text("📈 EMA Signal Watchlist\n" + "\n".join(f"• {s}" for s in symbols))
+
+# ==========================================
 # 5. MAIN
 # ==========================================
 if __name__ == '__main__':
@@ -229,10 +384,14 @@ if __name__ == '__main__':
     bot_app.add_handler(CommandHandler("price", add_price_alert))
     bot_app.add_handler(CommandHandler("trail", add_trail_alert))
     bot_app.add_handler(CommandHandler("list", list_alerts))
+    bot_app.add_handler(CommandHandler("ema", add_ema_watch))
+    bot_app.add_handler(CommandHandler("emaoff", remove_ema_watch))
+    bot_app.add_handler(CommandHandler("emalist", list_ema_watch))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
     
     loop = asyncio.get_event_loop()
     loop.create_task(monitor_loop(bot_app))
+    loop.create_task(ema_signal_loop(bot_app))
     
     print("Bot is starting...")
     bot_app.run_polling()
