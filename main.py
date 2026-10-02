@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import ccxt.async_support as ccxt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==========================================
 # 1. CONFIGURATION & DATABASE
@@ -374,10 +376,26 @@ async def list_ema_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("📈 EMA Signal Watchlist\n" + "\n".join(f"• {s}" for s in symbols))
 
+# Simple health check server for Render web service port binding
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
 # ==========================================
 # 5. MAIN
 # ==========================================
 if __name__ == '__main__':
+    # Start the dummy web server in a background thread so Render detects an open port
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+    print("Health check server started on port", os.environ.get("PORT", 10000))
+
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
     
     bot_app.add_handler(CommandHandler("start", start))
