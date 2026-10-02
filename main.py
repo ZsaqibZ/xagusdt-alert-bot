@@ -389,9 +389,12 @@ if __name__ == '__main__':
     bot_app.add_handler(CommandHandler("emalist", list_ema_watch))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
     
-    loop = asyncio.get_event_loop()
-    loop.create_task(monitor_loop(bot_app))
-    loop.create_task(ema_signal_loop(bot_app))
+    # Run background loops inside the application's post_init hook
+    async def post_init(application):
+        asyncio.create_task(monitor_loop(application))
+        asyncio.create_task(ema_signal_loop(application))
+
+    bot_app.post_init = post_init
     
     print("Bot is starting...")
-    bot_app.run_polling()
+    bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
