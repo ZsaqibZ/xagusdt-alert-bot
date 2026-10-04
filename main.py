@@ -581,11 +581,11 @@ async def health_check(request):
     return web.Response(text="Bot is running!")
 
 async def post_init(application):
-    # 1. Start background tasks safely inside the bot's event loop
+    # 1. Launch background loops safely inside the bot's existing event loop
     asyncio.create_task(monitor_loop(application))
     asyncio.create_task(liq_strategy_loop(application))
 
-    # 2. Start a dummy web server so Render's port detection passes
+    # 2. Bind the HTTP server to satisfy Render's port scanner
     port = int(os.environ.get("PORT", 8080))
     server = web.Application()
     server.router.add_get("/", health_check)
@@ -596,7 +596,12 @@ async def post_init(application):
     print(f"Health check server listening on port {port}")
 
 if __name__ == '__main__':
-    bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    bot_app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
     
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("price", add_price_alert))
@@ -608,9 +613,5 @@ if __name__ == '__main__':
     bot_app.add_handler(CommandHandler("liqlevels", show_liq_levels))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
     
-    loop = asyncio.get_event_loop()
-    loop.create_task(monitor_loop(bot_app))
-    loop.create_task(liq_strategy_loop(bot_app))
-    
     print("Bot is starting...")
-    bot_app.run_polling()
+    bot_app.run_polling(drop_pending_updates=True)
