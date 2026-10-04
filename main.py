@@ -7,8 +7,6 @@ from datetime import datetime, timedelta
 import ccxt.async_support as ccxt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==========================================
 # 1. CONFIGURATION & DATABASE
@@ -153,108 +151,258 @@ async def monitor_loop(application):
             await asyncio.sleep(30)
 
 # ==========================================
-# 3B. EMA SIGNAL SYSTEM (WEEKLY / MONTHLY)
+# 3B. LIQUIDITY STRATEGY (1H, GROWING LOOKBACK)
 # ==========================================
-# Settings (periods are counted in 1h candles, so keep EMA_TIMEFRAME at '1h')
-EMA_TIMEFRAME      = '1h'
-EMA_WEEKLY_PERIOD  = 24 * 7     # 168 candles = 1 week
-EMA_MONTHLY_PERIOD = 24 * 30    # 720 candles = 30 days
-EMA_WARMUP_MULT    = 3          # fetch period x 3 candles so the EMA settles
-EMA_PAGE_LIMIT     = 500        # candles per exchange request
-EMA_SCAN_DELAY     = 5          # seconds to wait after a candle closes
+# Settings
+LIQ_TIMEFRAME     = '1h'               # strategy runs natively on 1h candles
+LIQ_TF_MS         = 60 * 60 * 1000     # one 1h candle in milliseconds
+LIQ_BASE_LOOKBACK = 1000               # candles at first start, +1 for every new closed candle
+LIQ_PIVOT_LEN     = 5                  # candles on each side that confirm a swing high / low
+LIQ_ATR_LEN       = 14                 # ATR length that sizes the cluster tolerance
+LIQ_CLUSTER_ATR   = 0.3                # swing points within 0.3 x ATR form one level
+LIQ_MIN_TOUCHES   = 2                  # swing points needed for a level (2 = equal highs / lows)
+LIQ_MIN_CANDLES   = 100                # minimum history before signals are produced
+LIQ_LEVELS_SHOWN  = 3                  # levels per side shown by /liqlevels
+LIQ_PAGE_LIMIT    = 500                # candles per exchange request
+LIQ_SCAN_DELAY    = 5                  # seconds to wait after a candle closes
 
-EMA_SYSTEMS = [
-    {'name': 'Weekly',  'period': EMA_WEEKLY_PERIOD,  'label': 'Medium Sensitivity Signal'},
-    {'name': 'Monthly', 'period': EMA_MONTHLY_PERIOD, 'label': 'High Sensitivity Signal'},
+# Starting pairs (seeded once on first run, then managed with /liqadd and /liqdel)
+LIQ_DEFAULT_PAIRS = [
+    'BTC/USDT',  'ETH/USDT',  'BNB/USDT',  'SOL/USDT',  'XRP/USDT',
+    'DOGE/USDT', 'ADA/USDT',  'AVAX/USDT', 'TRX/USDT',  'LINK/USDT',
+    'DOT/USDT',  'LTC/USDT',  'BCH/USDT',  'ATOM/USDT', 'NEAR/USDT',
+    'UNI/USDT',  'SUI/USDT',  'APT/USDT',  'ARB/USDT',  'OP/USDT',
 ]
 
-def init_ema_db():
+liq_seen = {}   # symbol -> open time of the last candle already analysed
+
+def liq_now_ms():
+    return ccxt.Exchange.milliseconds()
+
+def init_liq_db():
     conn = sqlite3.connect('alerts.db')
-    conn.execute("CREATE TABLE IF NOT EXISTS ema_watchlist (symbol TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE IF NOT EXISTS liq_settings (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS liq_pairs (symbol TEXT PRIMARY KEY)")
+    conn.execute('''CREATE TABLE IF NOT EXISTS liq_candles
+                    (symbol TEXT, t INTEGER, o REAL, h REAL, l REAL, c REAL, v REAL,
+                     PRIMARY KEY (symbol, t))''')
+    if not conn.execute("SELECT 1 FROM liq_settings WHERE key='pairs_seeded'").fetchone():
+        conn.executemany("INSERT OR IGNORE INTO liq_pairs (symbol) VALUES (?)", [(s,) for s in LIQ_DEFAULT_PAIRS])
+        conn.execute("INSERT INTO liq_settings (key, value) VALUES ('pairs_seeded', '1')")
     conn.commit()
     conn.close()
 
-init_ema_db()
+init_liq_db()
 
 def fmt_price(p):
-    return f"{p:,.2f}" if p >= 1 else f"{p:.8f}".rstrip('0')
+    if p >= 100: return f"{p:,.2f}"
+    if p >= 1:   return f"{p:,.4f}"
+    return f"{p:.8f}".rstrip('0')
 
-async def fetch_ema_candles(exch, symbol, n_candles):
-    """Paginated 1h OHLCV fetch (exchanges cap candles per request). Closed candles only."""
-    tf_ms  = exch.parse_timeframe(EMA_TIMEFRAME) * 1000
-    now_ms = exch.milliseconds()
-    since  = now_ms - n_candles * tf_ms
+def liq_get_anchor():
+    """Start of the lookback window. Saved on the first run so restarts never shrink it."""
+    conn = sqlite3.connect('alerts.db')
+    row = conn.execute("SELECT value FROM liq_settings WHERE key='anchor_ms'").fetchone()
+    if row:
+        anchor = int(row[0])
+    else:
+        anchor = (liq_now_ms() // LIQ_TF_MS) * LIQ_TF_MS - LIQ_BASE_LOOKBACK * LIQ_TF_MS
+        conn.execute("INSERT INTO liq_settings (key, value) VALUES ('anchor_ms', ?)", (str(anchor),))
+        conn.commit()
+    conn.close()
+    return anchor
+
+def liq_get_pairs():
+    conn = sqlite3.connect('alerts.db')
+    pairs = [r[0] for r in conn.execute("SELECT symbol FROM liq_pairs ORDER BY rowid").fetchall()]
+    conn.close()
+    return pairs
+
+async def liq_sync_symbol(exch, symbol, anchor):
+    """Stores every closed 1h candle since the anchor. Only fetches what is missing."""
+    conn = sqlite3.connect('alerts.db')
+    last = conn.execute("SELECT MAX(t) FROM liq_candles WHERE symbol=?", (symbol,)).fetchone()[0]
+    since = anchor if last is None else last + LIQ_TF_MS
+    now_ms = liq_now_ms()
     candles = {}
 
-    while since < now_ms:
-        batch = await exch.fetch_ohlcv(symbol, EMA_TIMEFRAME, since=since, limit=EMA_PAGE_LIMIT)
-        if not batch:
-            break
-        for c in batch:
-            candles[c[0]] = c
-        next_since = batch[-1][0] + tf_ms
-        if next_since <= since:
-            break
-        since = next_since
+    try:
+        while since < now_ms:
+            batch = await exch.fetch_ohlcv(symbol, LIQ_TIMEFRAME, since=since, limit=LIQ_PAGE_LIMIT)
+            if not batch:
+                break
+            for c in batch:
+                candles[c[0]] = c
+            next_since = batch[-1][0] + LIQ_TF_MS
+            if next_since <= since:
+                break
+            since = next_since
 
-    # Drop the candle that is still forming
-    return [c for t, c in sorted(candles.items()) if t + tf_ms <= now_ms]
+        # Drop the candle that is still forming
+        rows = [(symbol, *c[:6]) for t, c in sorted(candles.items()) if t + LIQ_TF_MS <= now_ms]
+        conn.executemany("INSERT OR REPLACE INTO liq_candles (symbol, t, o, h, l, c, v) VALUES (?,?,?,?,?,?,?)", rows)
+        conn.commit()
+    finally:
+        conn.close()
 
-def detect_ema_cross(closes, period):
-    """Price close crossing the EMA on the last closed candle -> (side, close, ema) or None"""
-    ema = closes.ewm(span=period, adjust=False).mean()
-    prev_c, last_c = closes.iloc[-2], closes.iloc[-1]
-    prev_e, last_e = ema.iloc[-2], ema.iloc[-1]
+def liq_load_df(symbol, anchor):
+    conn = sqlite3.connect('alerts.db')
+    df = pd.read_sql_query("SELECT t, o, h, l, c, v FROM liq_candles WHERE symbol=? AND t>=? ORDER BY t",
+                           conn, params=(symbol, anchor))
+    conn.close()
+    return df
 
-    if prev_c <= prev_e and last_c > last_e:
-        return 'BUY', last_c, last_e
-    if prev_c >= prev_e and last_c < last_e:
-        return 'SELL', last_c, last_e
-    return None
+def liq_build_levels(df):
+    """Support / resistance levels from clustered swing points.
+    kind   : 'high' = resistance / buy-side liquidity, 'low' = support / sell-side liquidity
+    price  : outer edge of the cluster (where the resting stops sit)
+    touches: swing points in the cluster
+    swept  : price has already traded through the level since its last touch"""
+    df    = df.reset_index(drop=True)
+    n     = len(df)
+    highs = df['h'].to_numpy()
+    lows  = df['l'].to_numpy()
 
-def format_ema_signal(symbol, system, side, close, ema):
-    icon = "🟢" if side == 'BUY' else "🔴"
-    verb = "above" if side == 'BUY' else "below"
+    # Cluster tolerance from ATR (Wilder smoothing)
+    prev_c = df['c'].shift(1)
+    tr     = pd.concat([df['h'] - df['l'], (df['h'] - prev_c).abs(), (df['l'] - prev_c).abs()], axis=1).max(axis=1)
+    tol    = LIQ_CLUSTER_ATR * tr.ewm(alpha=1 / LIQ_ATR_LEN, adjust=False).mean().iloc[-1]
+
+    # Confirmed swing points (LIQ_PIVOT_LEN candles on both sides; equal extremes all count)
+    win      = 2 * LIQ_PIVOT_LEN + 1
+    piv_high = df['h'][df['h'] == df['h'].rolling(win, center=True).max()]
+    piv_low  = df['l'][df['l'] == df['l'].rolling(win, center=True).min()]
+
+    def cluster(pivots, kind):
+        groups, cur = [], []
+        for idx, price in sorted(pivots.items(), key=lambda kv: kv[1]):
+            if cur and price - cur[0][1] > tol:
+                groups.append(cur)
+                cur = []
+            cur.append((idx, price))
+        if cur:
+            groups.append(cur)
+
+        out = []
+        for g in groups:
+            if len(g) < LIQ_MIN_TOUCHES:
+                continue
+            last_idx = max(i for i, _ in g)
+            if kind == 'high':
+                price = max(p for _, p in g)
+                swept = last_idx + 1 < n and highs[last_idx + 1:].max() > price
+            else:
+                price = min(p for _, p in g)
+                swept = last_idx + 1 < n and lows[last_idx + 1:].min() < price
+            out.append({'kind': kind, 'price': price, 'touches': len(g), 'swept': bool(swept)})
+        return out
+
+    return cluster(piv_high, 'high') + cluster(piv_low, 'low')
+
+def liq_detect_signal(df):
+    """Liquidity sweep on the last closed candle: wick through a resting level, close back inside.
+    Sell-side liquidity swept (wick below support, close above)    -> BUY
+    Buy-side liquidity swept (wick above resistance, close below) -> SELL"""
+    if len(df) < LIQ_MIN_CANDLES:
+        return None
+
+    last   = df.iloc[-1]
+    levels = [lv for lv in liq_build_levels(df.iloc[:-1]) if not lv['swept']]
+
+    up   = [lv for lv in levels if lv['kind'] == 'high' and last['h'] > lv['price'] > last['c']]
+    down = [lv for lv in levels if lv['kind'] == 'low'  and last['l'] < lv['price'] < last['c']]
+    if bool(up) == bool(down):
+        return None  # nothing swept, or both sides swept (indecisive candle)
+
+    if down:
+        side, swept = 'BUY', down
+        ahead  = [lv['price'] for lv in levels if lv['kind'] == 'high' and lv['price'] > last['c']]
+        target = min(ahead) if ahead else None
+    else:
+        side, swept = 'SELL', up
+        ahead  = [lv['price'] for lv in levels if lv['kind'] == 'low' and lv['price'] < last['c']]
+        target = max(ahead) if ahead else None
+
+    return {
+        'side':   side,
+        'level':  max(swept, key=lambda lv: lv['touches']),
+        'count':  len(swept),
+        'high':   last['h'],
+        'low':    last['l'],
+        'close':  last['c'],
+        'target': target,
+    }
+
+def format_liq_signal(symbol, sig):
+    buy  = sig['side'] == 'BUY'
+    icon = "🟢" if buy else "🔴"
+    pool = "Sell-side" if buy else "Buy-side"
+    wick = f"Wick low: ${fmt_price(sig['low'])}" if buy else f"Wick high: ${fmt_price(sig['high'])}"
+    lv   = sig['level']
+
+    text = (
+        f"{icon} {sig['side']} - {symbol} ({LIQ_TIMEFRAME})\n"
+        f"{pool} liquidity swept\n\n"
+        f"Level: ${fmt_price(lv['price'])} ({lv['touches']} touches)\n"
+        f"{wick} | Close: ${fmt_price(sig['close'])}"
+    )
+    if sig['count'] > 1:
+        text += f"\nLevels swept: {sig['count']}"
+    if sig['target']:
+        pct = (sig['target'] / sig['close'] - 1) * 100
+        text += f"\nNext {'buy' if buy else 'sell'}-side liquidity: ${fmt_price(sig['target'])} ({pct:+.2f}%)"
+    return text
+
+def format_liq_levels(symbol, df):
+    close  = df['c'].iloc[-1]
+    levels = liq_build_levels(df)
+    above  = sorted([lv for lv in levels if lv['price'] > close],  key=lambda lv: lv['price'])[:LIQ_LEVELS_SHOWN]
+    below  = sorted([lv for lv in levels if lv['price'] <= close], key=lambda lv: -lv['price'])[:LIQ_LEVELS_SHOWN]
+
+    def line(lv):
+        pct  = (lv['price'] / close - 1) * 100
+        mark = "" if lv['swept'] else " 💧"
+        return f"• ${fmt_price(lv['price'])} ({pct:+.2f}%) - {lv['touches']} touches{mark}"
+
     return (
-        f"{icon} {side} - {symbol}\n"
-        f"{system['label']}\n\n"
-        f"Price closed {verb} the {system['name']} EMA ({system['period']}) on {EMA_TIMEFRAME}\n"
-        f"Close: ${fmt_price(close)} | EMA: ${fmt_price(ema)}"
+        f"📊 {symbol} | {LIQ_TIMEFRAME} | {len(df):,} candles\n\n"
+        f"Resistance / Buy-side liquidity\n" + ("\n".join(line(lv) for lv in reversed(above)) or "• none") + "\n\n"
+        f"Price: ${fmt_price(close)}\n\n"
+        f"Support / Sell-side liquidity\n" + ("\n".join(line(lv) for lv in below) or "• none") + "\n\n"
+        f"💧 = liquidity not yet swept"
     )
 
-async def scan_ema_signals(exch, application):
-    conn = sqlite3.connect('alerts.db')
-    symbols = [r[0] for r in conn.execute("SELECT symbol FROM ema_watchlist").fetchall()]
-    conn.close()
-
-    n_candles = max(s['period'] for s in EMA_SYSTEMS) * EMA_WARMUP_MULT
-    for symbol in symbols:
+async def liq_scan(exch, application):
+    anchor = liq_get_anchor()
+    for symbol in liq_get_pairs():
         try:
-            candles = await fetch_ema_candles(exch, symbol, n_candles)
-            df = pd.DataFrame(candles, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            await liq_sync_symbol(exch, symbol, anchor)
+            df = liq_load_df(symbol, anchor)
+            if df.empty:
+                continue
 
-            for s in EMA_SYSTEMS:
-                if len(df) < s['period'] + 2:
-                    continue  # not enough history (new listing)
-                signal = detect_ema_cross(df['c'], s['period'])
-                if signal:
-                    side, close, ema = signal
-                    await application.bot.send_message(CHAT_ID, format_ema_signal(symbol, s, side, close, ema))
+            # A symbol seen for the first time only sets the baseline (no stale signals)
+            last_t = int(df['t'].iloc[-1])
+            if symbol in liq_seen and last_t > liq_seen[symbol]:
+                sig = liq_detect_signal(df)
+                if sig:
+                    await application.bot.send_message(CHAT_ID, format_liq_signal(symbol, sig))
+            liq_seen[symbol] = last_t
         except Exception as e:
-            print(f"EMA Scan Error for {symbol}: {e}")
+            print(f"Liquidity Scan Error for {symbol}: {e}")
         await asyncio.sleep(0.1)
 
-async def ema_signal_loop(application):
+async def liq_strategy_loop(application):
     exch = ccxt.mexc({'enableRateLimit': True})
-    tf_sec = exch.parse_timeframe(EMA_TIMEFRAME)
+    tf_sec = LIQ_TF_MS // 1000
     while True:
-        # Signals only change when a candle closes, so wake up right after each close
-        now_sec = exch.milliseconds() / 1000
-        await asyncio.sleep(tf_sec - (now_sec % tf_sec) + EMA_SCAN_DELAY)
         try:
-            await scan_ema_signals(exch, application)
+            await liq_scan(exch, application)
         except Exception as e:
-            print(f"EMA Loop Error: {e}")
+            print(f"Liquidity Loop Error: {e}")
+        # Levels only change when a candle closes, so wake up right after each close
+        now_sec = liq_now_ms() / 1000
+        await asyncio.sleep(tf_sec - (now_sec % tf_sec) + LIQ_SCAN_DELAY)
 
 # ==========================================
 # 4. BOT COMMANDS (THE NEW GUI)
@@ -326,93 +474,95 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✅ Alert deleted.")
 
 # ==========================================
-# 4B. EMA SIGNAL COMMANDS
+# 4B. LIQUIDITY STRATEGY COMMANDS
 # ==========================================
-async def add_ema_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    exch = ccxt.mexc()
+async def add_liq_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    exch = ccxt.mexc({'enableRateLimit': True})
     try:
         symbol = context.args[0].upper()
-        await exch.fetch_ticker(symbol)  # validates the symbol
+        anchor = liq_get_anchor()
+        await update.message.reply_text(f"⏳ Loading {LIQ_TIMEFRAME} candles for {symbol}...")
+
+        await liq_sync_symbol(exch, symbol, anchor)
+        df = liq_load_df(symbol, anchor)
+        if df.empty:
+            raise ValueError("no candle data")
 
         conn = sqlite3.connect('alerts.db')
-        conn.execute("INSERT OR IGNORE INTO ema_watchlist (symbol) VALUES (?)", (symbol,))
+        conn.execute("INSERT OR IGNORE INTO liq_pairs (symbol) VALUES (?)", (symbol,))
         conn.commit()
         conn.close()
 
-        await update.message.reply_text(
-            f"✅ EMA signals enabled for {symbol}\n"
-            f"• Weekly EMA ({EMA_WEEKLY_PERIOD}) - Medium Sensitivity\n"
-            f"• Monthly EMA ({EMA_MONTHLY_PERIOD}) - High Sensitivity\n"
-            f"Checked at every {EMA_TIMEFRAME} candle close."
-        )
+        liq_seen[symbol] = int(df['t'].iloc[-1])
+        await update.message.reply_text(f"✅ {symbol} added to the liquidity strategy ({len(df):,} candles loaded)")
     except Exception:
-        await update.message.reply_text("❌ Use: `/ema BTC/USDT`", parse_mode='Markdown')
+        await update.message.reply_text("❌ Use: `/liqadd BTC/USDT` (pair must exist on MEXC spot)", parse_mode='Markdown')
     finally:
         await exch.close()
 
-async def remove_ema_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def remove_liq_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         symbol = context.args[0].upper()
-        conn = sqlite3.connect('alerts.db')
-        removed = conn.execute("DELETE FROM ema_watchlist WHERE symbol=?", (symbol,)).rowcount
-        conn.commit()
-        conn.close()
-
-        if removed:
-            await update.message.reply_text(f"✅ EMA signals disabled for {symbol}")
-        else:
-            await update.message.reply_text(f"{symbol} is not on the EMA watchlist.")
     except IndexError:
-        await update.message.reply_text("❌ Use: `/emaoff BTC/USDT`", parse_mode='Markdown')
-
-async def list_ema_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect('alerts.db')
-    symbols = [r[0] for r in conn.execute("SELECT symbol FROM ema_watchlist ORDER BY symbol").fetchall()]
-    conn.close()
-
-    if not symbols:
-        await update.message.reply_text("No symbols on the EMA watchlist.\nAdd one: /ema BTC/USDT")
+        await update.message.reply_text("❌ Use: `/liqdel BTC/USDT`", parse_mode='Markdown')
         return
 
-    await update.message.reply_text("📈 EMA Signal Watchlist\n" + "\n".join(f"• {s}" for s in symbols))
+    conn = sqlite3.connect('alerts.db')
+    removed = conn.execute("DELETE FROM liq_pairs WHERE symbol=?", (symbol,)).rowcount
+    conn.execute("DELETE FROM liq_candles WHERE symbol=?", (symbol,))
+    conn.commit()
+    conn.close()
+    liq_seen.pop(symbol, None)
 
-# Simple health check server for Render web service port binding
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
+    if removed:
+        await update.message.reply_text(f"✅ {symbol} removed from the liquidity strategy")
+    else:
+        await update.message.reply_text(f"{symbol} is not in the liquidity strategy.")
 
-def run_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
+async def list_liq_pairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pairs   = liq_get_pairs()
+    anchor  = liq_get_anchor()
+    candles = liq_now_ms() // LIQ_TF_MS - anchor // LIQ_TF_MS
+    since   = pd.to_datetime(anchor, unit='ms').strftime('%d %b %Y %H:%M')
+
+    await update.message.reply_text(
+        f"📈 Liquidity Strategy | {LIQ_TIMEFRAME}\n"
+        f"Lookback: {candles:,} candles (since {since} UTC)\n\n"
+        f"Pairs ({len(pairs)}):\n" + "\n".join(f"• {s}" for s in pairs)
+    )
+
+async def show_liq_levels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        symbol = context.args[0].upper()
+    except IndexError:
+        await update.message.reply_text("❌ Use: `/liqlevels BTC/USDT`", parse_mode='Markdown')
+        return
+
+    df = liq_load_df(symbol, liq_get_anchor())
+    if len(df) < LIQ_MIN_CANDLES:
+        await update.message.reply_text(f"No data for {symbol} yet. Add it with /liqadd {symbol}")
+        return
+    await update.message.reply_text(format_liq_levels(symbol, df))
+
 # ==========================================
 # 5. MAIN
 # ==========================================
 if __name__ == '__main__':
-    # Start the dummy web server in a background thread so Render detects an open port
-    t = threading.Thread(target=run_health_server, daemon=True)
-    t.start()
-    print("Health check server started on port", os.environ.get("PORT", 10000))
-
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
     
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("price", add_price_alert))
     bot_app.add_handler(CommandHandler("trail", add_trail_alert))
     bot_app.add_handler(CommandHandler("list", list_alerts))
-    bot_app.add_handler(CommandHandler("ema", add_ema_watch))
-    bot_app.add_handler(CommandHandler("emaoff", remove_ema_watch))
-    bot_app.add_handler(CommandHandler("emalist", list_ema_watch))
+    bot_app.add_handler(CommandHandler("liqadd", add_liq_pair))
+    bot_app.add_handler(CommandHandler("liqdel", remove_liq_pair))
+    bot_app.add_handler(CommandHandler("liqlist", list_liq_pairs))
+    bot_app.add_handler(CommandHandler("liqlevels", show_liq_levels))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
     
-    # Run background loops inside the application's post_init hook
-    async def post_init(application):
-        asyncio.create_task(monitor_loop(application))
-        asyncio.create_task(ema_signal_loop(application))
-
-    bot_app.post_init = post_init
+    loop = asyncio.get_event_loop()
+    loop.create_task(monitor_loop(bot_app))
+    loop.create_task(liq_strategy_loop(bot_app))
     
     print("Bot is starting...")
-    bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    bot_app.run_polling()
