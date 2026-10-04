@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import ccxt.async_support as ccxt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
-
+from aiohttp import web
 # ==========================================
 # 1. CONFIGURATION & DATABASE
 # ==========================================
@@ -171,7 +171,9 @@ LIQ_DEFAULT_PAIRS = [
     'BTC/USDT',  'ETH/USDT',  'BNB/USDT',  'SOL/USDT',  'XRP/USDT',
     'DOGE/USDT', 'ADA/USDT',  'AVAX/USDT', 'TRX/USDT',  'LINK/USDT',
     'DOT/USDT',  'LTC/USDT',  'BCH/USDT',  'ATOM/USDT', 'NEAR/USDT',
-    'UNI/USDT',  'SUI/USDT',  'APT/USDT',  'ARB/USDT',  'OP/USDT',
+    'UNI/USDT',  'SUI/USDT',  'APT/USDT',  'ARB/USDT',  'OP/USDT', 
+    'GOLD(XAUT)USDT',
+
 ]
 
 liq_seen = {}   # symbol -> open time of the last candle already analysed
@@ -547,8 +549,31 @@ async def show_liq_levels(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 # 5. MAIN
 # ==========================================
+async def health_check(request):
+    return web.Response(text="Bot is running!")
+
+async def post_init(application):
+    # 1. Start background tasks safely inside the bot's event loop
+    asyncio.create_task(monitor_loop(application))
+    asyncio.create_task(liq_strategy_loop(application))
+
+    # 2. Start a dummy web server so Render's port detection passes
+    port = int(os.environ.get("PORT", 8080))
+    server = web.Application()
+    server.router.add_get("/", health_check)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health check server listening on port {port}")
+
 if __name__ == '__main__':
-    bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    bot_app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
     
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("price", add_price_alert))
@@ -560,9 +585,6 @@ if __name__ == '__main__':
     bot_app.add_handler(CommandHandler("liqlevels", show_liq_levels))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
     
-    loop = asyncio.get_event_loop()
-    loop.create_task(monitor_loop(bot_app))
-    loop.create_task(liq_strategy_loop(bot_app))
-    
     print("Bot is starting...")
-    bot_app.run_polling()
+    # drop_pending_updates=True clears stale/competing polling requests on boot
+    bot_app.run_polling(drop_pending_updates=True)
