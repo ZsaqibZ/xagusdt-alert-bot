@@ -366,9 +366,18 @@ def format_liq_signal(symbol, sig):
 def format_liq_levels(symbol, df):
     close  = df['c'].iloc[-1]
     levels = liq_build_levels(df)
-    all_up = sorted([lv for lv in levels if lv['price'] > close],  key=lambda lv: lv['price'])
-    all_dn = sorted([lv for lv in levels if lv['price'] <= close], key=lambda lv: -lv['price'])
-    above, below = all_up[:LIQ_LEVELS_SHOWN], all_dn[:LIQ_LEVELS_SHOWN]
+    
+    # Filter by structural role as well as position relative to current price
+    resistances = [lv for lv in levels if lv['kind'] == 'high' and lv['price'] > close]
+    supports    = [lv for lv in levels if lv['kind'] == 'low'  and lv['price'] < close]
+    
+    # Sort resistances ascending so lowest resistance is closest to current price
+    all_up = sorted(resistances, key=lambda lv: lv['price'])
+    # Sort supports descending so highest support is closest to current price
+    all_dn = sorted(supports, key=lambda lv: -lv['price'])
+    
+    above = all_up[:LIQ_LEVELS_SHOWN]
+    below = all_dn[:LIQ_LEVELS_SHOWN]
 
     def line(lv):
         pct  = (lv['price'] / close - 1) * 100
@@ -377,9 +386,11 @@ def format_liq_levels(symbol, df):
 
     return (
         f"📊 {symbol} | {LIQ_TIMEFRAME} | {len(df):,} candles\n\n"
-        f"Major resistance / Buy-side liquidity ({len(above)} of {len(all_up)})\n" + ("\n".join(line(lv) for lv in reversed(above)) or "• none") + "\n\n"
+        f"Major resistance / Buy-side liquidity ({len(above)} of {len(all_up)})\n" + 
+        ("\n".join(line(lv) for lv in reversed(above)) or "• none") + "\n\n"
         f"Price: ${fmt_price(close)}\n\n"
-        f"Major support / Sell-side liquidity ({len(below)} of {len(all_dn)})\n" + ("\n".join(line(lv) for lv in below) or "• none") + "\n\n"
+        f"Major support / Sell-side liquidity ({len(below)} of {len(all_dn)})\n" + 
+        ("\n".join(line(lv) for lv in below) or "• none") + "\n\n"
         f"💧 = liquidity not yet swept"
     )
 
