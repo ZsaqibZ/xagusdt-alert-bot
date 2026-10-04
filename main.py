@@ -157,23 +157,23 @@ async def monitor_loop(application):
 LIQ_TIMEFRAME     = '1h'               # strategy runs natively on 1h candles
 LIQ_TF_MS         = 60 * 60 * 1000     # one 1h candle in milliseconds
 LIQ_BASE_LOOKBACK = 1000               # candles at first start, +1 for every new closed candle
-LIQ_PIVOT_LEN     = 5                  # candles on each side that confirm a swing high / low
+LIQ_PIVOT_LEN     = 5                  # candles on each side of a minor swing (each one counts as a retest)
+LIQ_MAJOR_LEN     = 48                 # a major level needs a swing that is the extreme of 48 candles each side (2 days)
 LIQ_ATR_LEN       = 14                 # ATR length that sizes the cluster tolerance
 LIQ_CLUSTER_ATR   = 0.3                # swing points within 0.3 x ATR form one level
-LIQ_MIN_TOUCHES   = 2                  # swing points needed for a level (2 = equal highs / lows)
+LIQ_MIN_TOUCHES   = 3                  # swings (retests) a level needs to count as major
 LIQ_MIN_CANDLES   = 100                # minimum history before signals are produced
 LIQ_LEVELS_SHOWN  = 3                  # levels per side shown by /liqlevels
 LIQ_PAGE_LIMIT    = 500                # candles per exchange request
 LIQ_SCAN_DELAY    = 5                  # seconds to wait after a candle closes
+LIQ_REPEAT_HOURS  = 0                  # 0 = never repeat a signal at the same level; N = allow again after N hours
 
 # Starting pairs (seeded once on first run, then managed with /liqadd and /liqdel)
 LIQ_DEFAULT_PAIRS = [
     'BTC/USDT',  'ETH/USDT',  'BNB/USDT',  'SOL/USDT',  'XRP/USDT',
     'DOGE/USDT', 'ADA/USDT',  'AVAX/USDT', 'TRX/USDT',  'LINK/USDT',
     'DOT/USDT',  'LTC/USDT',  'BCH/USDT',  'ATOM/USDT', 'NEAR/USDT',
-    'UNI/USDT',  'SUI/USDT',  'APT/USDT',  'ARB/USDT',  'OP/USDT', 
-    'GOLD(XAUT)USDT',
-
+    'UNI/USDT',  'SUI/USDT',  'APT/USDT',  'ARB/USDT',  'OP/USDT', 'GOLD(XAUT)USDT',
 ]
 
 liq_seen = {}   # symbol -> open time of the last candle already analysed
@@ -188,6 +188,7 @@ def init_liq_db():
     conn.execute('''CREATE TABLE IF NOT EXISTS liq_candles
                     (symbol TEXT, t INTEGER, o REAL, h REAL, l REAL, c REAL, v REAL,
                      PRIMARY KEY (symbol, t))''')
+    conn.execute("CREATE TABLE IF NOT EXISTS liq_signals (symbol TEXT, side TEXT, price REAL, t INTEGER)")
     if not conn.execute("SELECT 1 FROM liq_settings WHERE key='pairs_seeded'").fetchone():
         conn.executemany("INSERT OR IGNORE INTO liq_pairs (symbol) VALUES (?)", [(s,) for s in LIQ_DEFAULT_PAIRS])
         conn.execute("INSERT INTO liq_settings (key, value) VALUES ('pairs_seeded', '1')")
@@ -255,7 +256,9 @@ def liq_load_df(symbol, anchor):
     return df
 
 def liq_build_levels(df):
-    """Support / resistance levels from clustered swing points.
+    """MAJOR support / resistance levels over the whole window passed in.
+    A level is major when it is built around a major swing (extreme of +/- LIQ_MAJOR_LEN candles)
+    and price has swung off it at least LIQ_MIN_TOUCHES times. Minor, once-touched swings are ignored.
     kind   : 'high' = resistance / buy-side liquidity, 'low' = support / sell-side liquidity
     price  : outer edge of the cluster (where the resting stops sit)
     touches: swing points in the cluster
@@ -275,7 +278,12 @@ def liq_build_levels(df):
     piv_high = df['h'][df['h'] == df['h'].rolling(win, center=True).max()]
     piv_low  = df['l'][df['l'] == df['l'].rolling(win, center=True).min()]
 
-    def cluster(pivots, kind):
+    # Major swings: extreme of LIQ_MAJOR_LEN candles on both sides
+    mwin       = 2 * LIQ_MAJOR_LEN + 1
+    major_high = set(df.index[df['h'] == df['h'].rolling(mwin, center=True).max()])
+    major_low  = set(df.index[df['l'] == df['l'].rolling(mwin, center=True).min()])
+
+    def cluster(pivots, kind, major):
         groups, cur = [], []
         for idx, price in sorted(pivots.items(), key=lambda kv: kv[1]):
             if cur and price - cur[0][1] > tol:
@@ -287,7 +295,7 @@ def liq_build_levels(df):
 
         out = []
         for g in groups:
-            if len(g) < LIQ_MIN_TOUCHES:
+            if len(g) < LIQ_MIN_TOUCHES or not any(i in major for i, _ in g):
                 continue
             last_idx = max(i for i, _ in g)
             if kind == 'high':
@@ -296,10 +304,10 @@ def liq_build_levels(df):
             else:
                 price = min(p for _, p in g)
                 swept = last_idx + 1 < n and lows[last_idx + 1:].min() < price
-            out.append({'kind': kind, 'price': price, 'touches': len(g), 'swept': bool(swept)})
+            out.append({'kind': kind, 'price': price, 'touches': len(g), 'swept': bool(swept), 'tol': tol})
         return out
 
-    return cluster(piv_high, 'high') + cluster(piv_low, 'low')
+    return cluster(piv_high, 'high', major_high) + cluster(piv_low, 'low', major_low)
 
 def liq_detect_signal(df):
     """Liquidity sweep on the last closed candle: wick through a resting level, close back inside.
@@ -358,8 +366,9 @@ def format_liq_signal(symbol, sig):
 def format_liq_levels(symbol, df):
     close  = df['c'].iloc[-1]
     levels = liq_build_levels(df)
-    above  = sorted([lv for lv in levels if lv['price'] > close],  key=lambda lv: lv['price'])[:LIQ_LEVELS_SHOWN]
-    below  = sorted([lv for lv in levels if lv['price'] <= close], key=lambda lv: -lv['price'])[:LIQ_LEVELS_SHOWN]
+    all_up = sorted([lv for lv in levels if lv['price'] > close],  key=lambda lv: lv['price'])
+    all_dn = sorted([lv for lv in levels if lv['price'] <= close], key=lambda lv: -lv['price'])
+    above, below = all_up[:LIQ_LEVELS_SHOWN], all_dn[:LIQ_LEVELS_SHOWN]
 
     def line(lv):
         pct  = (lv['price'] / close - 1) * 100
@@ -368,11 +377,28 @@ def format_liq_levels(symbol, df):
 
     return (
         f"📊 {symbol} | {LIQ_TIMEFRAME} | {len(df):,} candles\n\n"
-        f"Resistance / Buy-side liquidity\n" + ("\n".join(line(lv) for lv in reversed(above)) or "• none") + "\n\n"
+        f"Major resistance / Buy-side liquidity ({len(above)} of {len(all_up)})\n" + ("\n".join(line(lv) for lv in reversed(above)) or "• none") + "\n\n"
         f"Price: ${fmt_price(close)}\n\n"
-        f"Support / Sell-side liquidity\n" + ("\n".join(line(lv) for lv in below) or "• none") + "\n\n"
+        f"Major support / Sell-side liquidity ({len(below)} of {len(all_dn)})\n" + ("\n".join(line(lv) for lv in below) or "• none") + "\n\n"
         f"💧 = liquidity not yet swept"
     )
+
+def liq_already_sent(symbol, sig, t):
+    """True if this pair already fired the same side at (about) the same level."""
+    lv    = sig['level']
+    min_t = 0 if LIQ_REPEAT_HOURS == 0 else t - LIQ_REPEAT_HOURS * LIQ_TF_MS
+    conn  = sqlite3.connect('alerts.db')
+    row   = conn.execute("SELECT 1 FROM liq_signals WHERE symbol=? AND side=? AND ABS(price - ?) <= ? AND t >= ?",
+                         (symbol, sig['side'], lv['price'], lv['tol'], min_t)).fetchone()
+    conn.close()
+    return row is not None
+
+def liq_record_signal(symbol, sig, t):
+    conn = sqlite3.connect('alerts.db')
+    conn.execute("INSERT INTO liq_signals (symbol, side, price, t) VALUES (?,?,?,?)",
+                 (symbol, sig['side'], sig['level']['price'], t))
+    conn.commit()
+    conn.close()
 
 async def liq_scan(exch, application):
     anchor = liq_get_anchor()
@@ -387,8 +413,9 @@ async def liq_scan(exch, application):
             last_t = int(df['t'].iloc[-1])
             if symbol in liq_seen and last_t > liq_seen[symbol]:
                 sig = liq_detect_signal(df)
-                if sig:
+                if sig and not liq_already_sent(symbol, sig, last_t):
                     await application.bot.send_message(CHAT_ID, format_liq_signal(symbol, sig))
+                    liq_record_signal(symbol, sig, last_t)
             liq_seen[symbol] = last_t
         except Exception as e:
             print(f"Liquidity Scan Error for {symbol}: {e}")
@@ -549,6 +576,7 @@ async def show_liq_levels(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 # 5. MAIN
 # ==========================================
+
 async def health_check(request):
     return web.Response(text="Bot is running!")
 
@@ -568,12 +596,7 @@ async def post_init(application):
     print(f"Health check server listening on port {port}")
 
 if __name__ == '__main__':
-    bot_app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
     
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("price", add_price_alert))
@@ -585,6 +608,9 @@ if __name__ == '__main__':
     bot_app.add_handler(CommandHandler("liqlevels", show_liq_levels))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
     
+    loop = asyncio.get_event_loop()
+    loop.create_task(monitor_loop(bot_app))
+    loop.create_task(liq_strategy_loop(bot_app))
+    
     print("Bot is starting...")
-    # drop_pending_updates=True clears stale/competing polling requests on boot
-    bot_app.run_polling(drop_pending_updates=True)
+    bot_app.run_polling()
