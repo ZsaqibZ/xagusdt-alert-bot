@@ -17,21 +17,20 @@ CHAT_ID = os.environ.get("CHAT_ID", "YOUR_CHAT_ID")
 
 LIQ_TIMEFRAME     = '1h'               # Runs natively on 1h candles
 LIQ_TF_MS         = 60 * 60 * 1000     # 1h in milliseconds
-LIQ_BASE_LOOKBACK = 1000               # Base historical lookback window (1000 candles)
-LIQ_PIVOT_LEN     = 5                  # Bars on each side to confirm a swing fractal
+LIQ_BASE_LOOKBACK = 2000               # Base historical lookback window (1000 candles)
+LIQ_PIVOT_LEN     = 12                 # Bars on each side to confirm a swing fractal
 LIQ_ATR_LEN       = 14                 # ATR period for cluster sizing
 LIQ_CLUSTER_ATR   = 0.35               # Tolerance multiplier: cluster width = 0.35 * ATR
 LIQ_MIN_TOUCHES   = 2                  # Minimum swing touches required to validate a level
-LIQ_LEVELS_SHOWN  = 3                  # Top levels displayed in /liqlevels
+LIQ_LEVELS_SHOWN  = 5                  # Top levels displayed in /liqlevels
 LIQ_PAGE_LIMIT    = 500                # MEXC pagination batch size
 LIQ_SCAN_DELAY    = 5                  # Delay (seconds) after candle close before scanning
 
 # Exactly 20 default crypto pairs seeded on initial launch
 LIQ_DEFAULT_PAIRS = [
     'BTC/USDT',  'ETH/USDT',  'SOL/USDT',  'BNB/USDT',  'XRP/USDT',
-    'DOGE/USDT', 'ADA/USDT',  'AVAX/USDT', 'SUI/USDT',  'LINK/USDT',
-    'NEAR/USDT', 'APT/USDT',  'DOT/USDT',  'LTC/USDT',  'BCH/USDT',
-    'TRX/USDT',  'UNI/USDT',  'ARB/USDT',  'OP/USDT',   'PEPE/USDT'
+    'DOGE/USDT', 'ADA/USDT',  'SUI/USDT',  'LINK/USDT','NEAR/USDT', 
+    'APT/USDT',  'LTC/USDT',  'BCH/USDT','TRX/USDT',  'GOLD(XAUT)USDT',
 ]
 
 liq_seen = {}
